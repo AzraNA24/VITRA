@@ -19,10 +19,10 @@
 unsigned long lastSend = 0;
 const unsigned long SEND_INTERVAL = 3000;
 
+// INI BUAT SIMULASI CRITICAL AJAAA. KALAU UDAH PAKAI SENSOR< UBAH, YESS
+// 'e' = kritis, 'n' = balik normal.
+bool simEmergency = false;
 
-// =====================================================
-// SETUP
-// =====================================================
 
 void setup() {
 
@@ -74,12 +74,39 @@ void setup() {
 
   Serial.println();
   Serial.println("Sense siap mengirim data...");
+  Serial.println("Serial: 'e' = simulasi darurat, 'n' = normal");
+}
+
+void handleSerialCommand() {
+
+  while (Serial.available()) {
+
+    char c = (char)Serial.read();
+
+    if (c == 'e') {
+      simEmergency = true;
+      Serial.println("[SIM] Mode DARURAT aktif");
+    } else if (c == 'n') {
+      simEmergency = false;
+      Serial.println("[SIM] Mode normal");
+    }
+  }
 }
 
 void sendPatientData() {
-  int heartRate = random(70, 100);
-  int spo2 = random(95, 100);
-  float temperature = random(360, 380) / 10.0;
+  int heartRate;
+  int spo2;
+  float temperature;
+
+  if (simEmergency) {
+    heartRate = random(140, 160);
+    spo2 = random(82, 88);
+    temperature = random(396, 405) / 10.0;
+  } else {
+    heartRate = random(70, 100);
+    spo2 = random(95, 100);
+    temperature = random(360, 380) / 10.0;
+  }
 
   String packet =
     "SENSE|" +
@@ -100,6 +127,8 @@ void sendPatientData() {
 }
 
 void loop() {
+
+  handleSerialCommand();
 
   if (millis() - lastSend >= SEND_INTERVAL) {
 
