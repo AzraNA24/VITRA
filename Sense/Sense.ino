@@ -4,12 +4,10 @@
 
 #define NODE_ID "VITRA-001"
 
-// Pin SX1278
 #define LORA_SS   5
 #define LORA_RST  14
 #define LORA_DIO0 26
 
-// SPI ESP32
 #define SPI_SCK  18
 #define SPI_MISO 19
 #define SPI_MOSI 23
@@ -28,13 +26,14 @@ void setup() {
 
   Serial.begin(115200);
   delay(1000);
+  // Ini randomizer juga hapus ajaa
+  randomSeed(analogRead(0) + micros());
 
   Serial.println();
   Serial.println("================================");
   Serial.println("       VITRA-SENSE");
   Serial.println("================================");
 
-  // SPI
   SPI.begin(
     SPI_SCK,
     SPI_MISO,
@@ -42,14 +41,12 @@ void setup() {
     LORA_SS
   );
 
-  // LoRa pin
   LoRa.setPins(
     LORA_SS,
     LORA_RST,
     LORA_DIO0
   );
 
-  // LoRa initialization
   if (!LoRa.begin(LORA_FREQUENCY)) {
 
     Serial.println("[LoRa] GAGAL!");
@@ -64,13 +61,13 @@ void setup() {
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
 
-  // CRC
   LoRa.enableCrc();
 
   Serial.println("[LoRa] OK");
   Serial.println("[LoRa] Frequency : 433 MHz");
   Serial.println("[LoRa] SF        : 9");
   Serial.println("[LoRa] BW        : 125 kHz");
+  Serial.println("[LoRa] Node ID   : " NODE_ID);
 
   Serial.println();
   Serial.println("Sense siap mengirim data...");

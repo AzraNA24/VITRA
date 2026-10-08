@@ -23,70 +23,62 @@ const char* AP_PASSWORD = "12345678";
 
 #define LORA_FREQUENCY 433E6
 
-const int   SPO2_CRIT_LT = 90;
-const int   SPO2_WARN_LT = 95;
 
-const int   HR_CRIT_LT   = 40;
-const int   HR_WARN_LT   = 50;
-const int   HR_WARN_GT   = 110;
-const int   HR_CRIT_GT   = 130;
+// normal HR 70-100 / SpO2 95-100 / Temp 36.0-38.0
+// darurat HR 140-160 / SpO2 82-88 / Temp 39.6-40.5)
+// Ionno nanti gimana. Ganti aja. :v
 
-const float TEMP_CRIT_LT = 35.0;
-const float TEMP_WARN_LT = 36.0;
-const float TEMP_WARN_GT = 38.0;
-const float TEMP_CRIT_GT = 39.5;
+#define HR_WARN_HI 100
+#define HR_WARN_LO 60
+#define HR_CRIT_HI 130
+#define HR_CRIT_LO 50
+
+#define SPO2_WARN 95
+#define SPO2_CRIT 90
+
+#define TEMP_WARN 37.8
+#define TEMP_CRIT 39.0
+#define TEMP_CRIT_LO 35.0
+
+#define OFFLINE_S 15
+
+#define EMERG_RESEND_MS 4000
 
 
-// Sense dianggap offline kalau tidak ada paket selama ini
-const unsigned long SENSE_TIMEOUT_MS = 15000;
-const uint8_t ALERT_CONFIRM = 2;
+// -----------------------------------------------------
+// Web Server
+// -----------------------------------------------------
 
-const unsigned long ALERT_RETRY_FAST_MS = 4000;
-const unsigned long ALERT_RETRY_SLOW_MS = 30000;
-const uint8_t       ALERT_FAST_TRIES    = 5;
+WebServer server(80);
 
+unsigned long packetCount = 0;
+unsigned long bootMs = 0;
 
-// Data pasien = ifo + vital
 #define MAX_PATIENTS 20
 
 struct Patient {
   String id;
-  String age;
-  String gender;
-  String status;
-  String triage;
-  bool   registered;
+  bool reg = false;
+  String age, gender, status, triage;
 
-  bool          hasVital;
-  int           hr;
-  int           spo2;
-  float         temp;
-  int           rssi;
-  uint32_t      packets;
-  unsigned long lastSeen;
+  bool hasVitals = false;
+  int hr = 0;
+  int spo2 = 0;
+  float temp = 0;
+  unsigned long lastVitalsMs = 0;
+  int rssi = 0;
 
-  uint8_t lvlHr;
-  uint8_t lvlSpo2;
-  uint8_t lvlTemp;
-  uint8_t level;
-  String  why;
-  uint8_t critStreak;
-
-  uint8_t       alertState;
-  uint8_t       alertTries;
-  unsigned long lastAlertTx;
+  // 0 = tidak ada, 1 = terkirim menunggu ACK, 2 = di-ACK LOG
+  int alert = 0; 
+  unsigned long lastEmergMs = 0;
 };
 
 Patient patients[MAX_PATIENTS];
 int patientCount = 0;
 
-unsigned long packetCount = 0;
-
-WebServer server(80);
-
 Preferences prefs;
 
-// Rapih-rapih input
+// Besih-bersih
 String sanitizeField(String s, size_t maxLen) {
 
   String out = "";
@@ -96,7 +88,7 @@ String sanitizeField(String s, size_t maxLen) {
     char c = s[i];
 
     if (c == '|' || c == '=' || c == '<' || c == '>' ||
-        c == '&' || c == '\"' || c == '\'' || c == '\\' ||
+        c == '&' || c == '"' || c == '\'' || c == '\\' ||
         (uint8_t)c < 32) {
       c = ' ';
     }
@@ -113,8 +105,6 @@ String sanitizeField(String s, size_t maxLen) {
   return out;
 }
 
-
-// Ambil nilai dari "|KEY=value" di dalam paket
 String getField(const String &packet, const String &key) {
 
   String needle = "|" + key + "=";
@@ -137,25 +127,6 @@ String getField(const String &packet, const String &key) {
 }
 
 
-bool validSenseId(const String &s) {
-
-  if (!s.startsWith("VITRA-") || s.length() > 20) {
-    return false;
-  }
-
-  for (size_t i = 0; i < s.length(); i++) {
-
-    char c = s[i];
-
-    if (!isalnum((unsigned char)c) && c != '-') {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-
 void sendLoRa(const String &msg) {
   delay(50);
 
@@ -164,50 +135,13 @@ void sendLoRa(const String &msg) {
   LoRa.endPacket();
 }
 
-// OLAHAN DATA PASIEN
-void resetPatient(int idx, const String &id) {
-
-  Patient &p = patients[idx];
-
-  p.id         = id;
-  p.age        = "";
-  p.gender     = "";
-  p.status     = "";
-  p.triage     = "";
-  p.registered = false;
-
-  p.hasVital = false;
-  p.hr       = 0;
-  p.spo2     = 0;
-  p.temp     = 0;
-  p.rssi     = 0;
-  p.packets  = 0;
-  p.lastSeen = 0;
-
-  p.lvlHr   = 0;
-  p.lvlSpo2 = 0;
-  p.lvlTemp = 0;
-  p.level   = 0;
-  p.why     = "";
-  p.critStreak = 0;
-
-  p.alertState  = 0;
-  p.alertTries  = 0;
-  p.lastAlertTx = 0;
-}
-
-
-// Hanya pasien yang sudah diregistrasi dari LOG yang disimpan
 void savePatients() {
 
   String s = "";
 
   for (int i = 0; i < patientCount; i++) {
 
-    if (!patients[i].registered) {
-      continue;
-    }
-
+    if (!patients[i].reg) continue;
     s += patients[i].id + "|" +
          patients[i].age + "|" +
          patients[i].gender + "|" +
@@ -249,15 +183,14 @@ void loadPatients() {
       continue;
     }
 
-    int idx = patientCount++;
+    patients[patientCount].id     = line.substring(0, p1);
+    patients[patientCount].reg    = true;
+    patients[patientCount].age    = line.substring(p1 + 1, p2);
+    patients[patientCount].gender = line.substring(p2 + 1, p3);
+    patients[patientCount].status = line.substring(p3 + 1, p4);
+    patients[patientCount].triage = line.substring(p4 + 1);
 
-    resetPatient(idx, line.substring(0, p1));
-
-    patients[idx].age        = line.substring(p1 + 1, p2);
-    patients[idx].gender     = line.substring(p2 + 1, p3);
-    patients[idx].status     = line.substring(p3 + 1, p4);
-    patients[idx].triage     = line.substring(p4 + 1);
-    patients[idx].registered = true;
+    patientCount++;
   }
 }
 
@@ -265,204 +198,152 @@ void loadPatients() {
 int findPatient(const String &id) {
 
   for (int i = 0; i < patientCount; i++) {
-
     if (patients[i].id == id) {
       return i;
     }
-
   }
 
   return -1;
 }
 
-int addPatient(const String &id) {
+int findOrCreatePatient(const String &id) {
 
-  if (patientCount < MAX_PATIENTS) {
+  int idx = findPatient(id);
 
-    int idx = patientCount++;
-
-    resetPatient(idx, id);
-
+  if (idx >= 0) {
     return idx;
   }
 
-  int victim = -1;
-
-  for (int i = 0; i < patientCount; i++) {
-
-    if (patients[i].registered) {
-      continue;
-    }
-
-    if (victim < 0 || patients[i].lastSeen < patients[victim].lastSeen) {
-      victim = i;
-    }
-  }
-
-  if (victim < 0) {
+  if (patientCount >= MAX_PATIENTS) {
     return -1;
   }
 
-  resetPatient(victim, id);
+  idx = patientCount++;
+  patients[idx] = Patient();
+  patients[idx].id = id;
 
-  return victim;
+  return idx;
 }
 
 
-// UPDATE update Patient
+// Tambah pasien baru atau timpa data registrasi lama dengan ID Sense yang sama
 bool upsertPatient(const String &id, const String &age,
                    const String &gender, const String &status,
                    const String &triage) {
 
-  int idx = findPatient(id);
-
-  if (idx < 0) {
-    idx = addPatient(id);
-  }
+  int idx = findOrCreatePatient(id);
 
   if (idx < 0) {
     return false;
   }
 
-  patients[idx].registered = true;
-  patients[idx].age        = age;
-  patients[idx].gender     = gender;
-  patients[idx].status     = status;
-  patients[idx].triage     = triage;
+  patients[idx].reg    = true;
+  patients[idx].age    = age;
+  patients[idx].gender = gender;
+  patients[idx].status = status;
+  patients[idx].triage = triage;
 
   savePatients();
 
   return true;
 }
 
+struct VitalLevel {
+  int lh, ls, lt, lv;
+  String why;
+};
 
-void evaluateVitals(int idx) {
+VitalLevel classifyVitals(int hr, int spo2, float temp) {
+
+  VitalLevel v;
+  v.lh = 0; v.ls = 0; v.lt = 0;
+
+  String why = "";
+
+  if (hr >= HR_CRIT_HI || hr <= HR_CRIT_LO) {
+    v.lh = 2;
+    why += "HR Kritis+";
+  } else if (hr >= HR_WARN_HI || hr <= HR_WARN_LO) {
+    v.lh = 1;
+    why += "HR Waspada+";
+  }
+
+  if (spo2 <= SPO2_CRIT) {
+    v.ls = 2;
+    why += "SpO2 Kritis+";
+  } else if (spo2 <= SPO2_WARN) {
+    v.ls = 1;
+    why += "SpO2 Waspada+";
+  }
+
+  if (temp >= TEMP_CRIT || temp <= TEMP_CRIT_LO) {
+    v.lt = 2;
+    why += "Suhu Kritis+";
+  } else if (temp >= TEMP_WARN) {
+    v.lt = 1;
+    why += "Suhu Waspada+";
+  }
+
+  if (why.endsWith("+")) {
+    why.remove(why.length() - 1);
+  }
+
+  v.why = why;
+  v.lv = max(v.lh, max(v.ls, v.lt));
+
+  return v;
+}
+
+void updateEmergencyState(int idx, int lv) {
 
   Patient &p = patients[idx];
 
-  String crit = "";
-  String warn = "";
+  if (lv >= 2) {
 
-  auto add = [](String &list, const char *msg) {
-    if (list.length() > 0) {
-      list += "+";
+    bool needSend = (p.alert == 0) ||
+                    (p.alert == 1 && millis() - p.lastEmergMs >= EMERG_RESEND_MS);
+
+    if (needSend) {
+
+      VitalLevel v = classifyVitals(p.hr, p.spo2, p.temp);
+      String whyEsc = v.why;
+      whyEsc.replace(" ", "_");
+
+      String packet =
+        "EMERG|" + p.id +
+        "|HR=" + String(p.hr) +
+        "|SPO2=" + String(p.spo2) +
+        "|TEMP=" + String(p.temp, 1) +
+        "|WHY=" + whyEsc;
+
+      Serial.println("[LINK] >>> KIRIM DARURAT ke LOG: " + packet);
+
+      sendLoRa(packet);
+
+      p.alert = 1;
+      p.lastEmergMs = millis();
     }
-    list += msg;
-  };
 
-  p.lvlHr   = 0;
-  p.lvlSpo2 = 0;
-  p.lvlTemp = 0;
-
-  if (p.hr <= 0) {
-    p.lvlHr = 1;
-    add(warn, "HR tidak terbaca");
-  } else if (p.hr < HR_CRIT_LT) {
-    p.lvlHr = 2;
-    add(crit, "HR rendah");
-  } else if (p.hr > HR_CRIT_GT) {
-    p.lvlHr = 2;
-    add(crit, "HR tinggi");
-  } else if (p.hr < HR_WARN_LT) {
-    p.lvlHr = 1;
-    add(warn, "HR rendah");
-  } else if (p.hr > HR_WARN_GT) {
-    p.lvlHr = 1;
-    add(warn, "HR tinggi");
+  } else {
+    if (p.alert != 0) {
+      p.alert = 0;
+    }
   }
-
-  if (p.spo2 <= 0) {
-    p.lvlSpo2 = 1;
-    add(warn, "SpO2 tidak terbaca");
-  } else if (p.spo2 < SPO2_CRIT_LT) {
-    p.lvlSpo2 = 2;
-    add(crit, "SpO2 rendah");
-  } else if (p.spo2 < SPO2_WARN_LT) {
-    p.lvlSpo2 = 1;
-    add(warn, "SpO2 rendah");
-  }
-
-  if (p.temp <= 0) {
-    p.lvlTemp = 1;
-    add(warn, "Suhu tidak terbaca");
-  } else if (p.temp < TEMP_CRIT_LT) {
-    p.lvlTemp = 2;
-    add(crit, "Suhu rendah");
-  } else if (p.temp > TEMP_CRIT_GT) {
-    p.lvlTemp = 2;
-    add(crit, "Suhu tinggi");
-  } else if (p.temp < TEMP_WARN_LT) {
-    p.lvlTemp = 1;
-    add(warn, "Suhu rendah");
-  } else if (p.temp > TEMP_WARN_GT) {
-    p.lvlTemp = 1;
-    add(warn, "Suhu tinggi");
-  }
-
-  uint8_t lv = p.lvlHr;
-
-  if (p.lvlSpo2 > lv) {
-    lv = p.lvlSpo2;
-  }
-
-  if (p.lvlTemp > lv) {
-    lv = p.lvlTemp;
-  }
-
-  p.level = lv;
-  p.why   = (lv == 2) ? crit : warn;
-}
-
-void sendAlert(int idx) {
-
-  Patient &p = patients[idx];
-
-  String packet =
-    "ALERT|" + p.id +
-    "|HR=" + String(p.hr) +
-    "|SPO2=" + String(p.spo2) +
-    "|TEMP=" + String(p.temp, 1) +
-    "|WHY=" + p.why +
-    "|AGE=" + (p.registered ? p.age : String("-")) +
-    "|GENDER=" + (p.registered ? p.gender : String("-")) +
-    "|STATUS=" + (p.registered ? p.status : String("-")) +
-    "|TRIAGE=" + (p.registered ? p.triage : String("-"));
-
-  p.alertTries++;
-  p.lastAlertTx = millis();
-
-  Serial.println();
-  Serial.println("[LINK] EMERGENCY -> LOG (kirim ke-" + String(p.alertTries) + ")");
-  Serial.println(packet);
-
-  sendLoRa(packet);
 }
 
 
-// Ulangi ALERT yang belum dikonfirmasi LOG
-void serviceAlerts() {
+void handleEmergencyAck(const String &packet) {
+  String id = packet.substring(String("EMACK|").length());
 
-  unsigned long now = millis();
+  int idx = findPatient(id);
 
-  for (int i = 0; i < patientCount; i++) {
-
-    Patient &p = patients[i];
-
-    if (p.alertState != 1) {
-      continue;
-    }
-
-    unsigned long wait =
-      (p.alertTries < ALERT_FAST_TRIES) ? ALERT_RETRY_FAST_MS
-                                        : ALERT_RETRY_SLOW_MS;
-
-    if (now - p.lastAlertTx >= wait) {
-
-      sendAlert(i);
-
-      return;   // satu ALERT per putaran loop
-    }
+  if (idx < 0) {
+    return;
   }
+
+  patients[idx].alert = 2;
+
+  Serial.println("[LINK] Darurat " + id + " sudah dikonfirmasi VITRA LOG");
 }
 
 
@@ -700,54 +581,55 @@ void handleRoot() {
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
+String jsonEscape(const String &s) {
+  String out = s;
+  out.replace("\\", "\\\\");
+  out.replace("\"", "\\\"");
+  return out;
+}
+
 void handleApiData() {
 
-  unsigned long now = millis();
+  String json = "{";
 
-  String json;
-  json.reserve(4096);
+  json += "\"packets\":" + String(packetCount) + ",";
+  json += "\"uptime\":" + String((millis() - bootMs) / 1000) + ",";
 
-  json += "{\"uptime\":" + String(now / 1000);
-  json += ",\"packets\":" + String(packetCount);
-  json += ",\"patients\":[";
+  json += "\"patients\":[";
 
   for (int i = 0; i < patientCount; i++) {
 
     Patient &p = patients[i];
 
-    if (i > 0) {
-      json += ",";
-    }
+    if (i > 0) json += ",";
 
-    json += "{\"id\":\"" + p.id + "\"";
-    json += ",\"reg\":" + String(p.registered ? "true" : "false");
-    json += ",\"age\":\"" + p.age + "\"";
-    json += ",\"gender\":\"" + p.gender + "\"";
-    json += ",\"status\":\"" + p.status + "\"";
-    json += ",\"triage\":\"" + p.triage + "\"";
-    json += ",\"hasv\":" + String(p.hasVital ? "true" : "false");
+    VitalLevel v = classifyVitals(p.hr, p.spo2, p.temp);
+    long ago = p.hasVitals ? (long)((millis() - p.lastVitalsMs) / 1000) : 0;
 
-    if (p.hasVital) {
-      json += ",\"hr\":" + String(p.hr);
-      json += ",\"spo2\":" + String(p.spo2);
-      json += ",\"temp\":" + String(p.temp, 1);
-      json += ",\"rssi\":" + String(p.rssi);
-      json += ",\"ago\":" + String((now - p.lastSeen) / 1000);
-      json += ",\"pkts\":" + String(p.packets);
-    }
-
-    json += ",\"lh\":" + String(p.lvlHr);
-    json += ",\"ls\":" + String(p.lvlSpo2);
-    json += ",\"lt\":" + String(p.lvlTemp);
-    json += ",\"lv\":" + String(p.level);
-    json += ",\"why\":\"" + p.why + "\"";
-    json += ",\"alert\":" + String(p.alertState);
+    json += "{";
+    json += "\"id\":\"" + jsonEscape(p.id) + "\",";
+    json += "\"reg\":" + String(p.reg ? "true" : "false") + ",";
+    json += "\"age\":\"" + jsonEscape(p.age) + "\",";
+    json += "\"gender\":\"" + jsonEscape(p.gender) + "\",";
+    json += "\"status\":\"" + jsonEscape(p.status) + "\",";
+    json += "\"triage\":\"" + jsonEscape(p.triage) + "\",";
+    json += "\"hasv\":" + String(p.hasVitals ? "true" : "false") + ",";
+    json += "\"hr\":" + String(p.hr) + ",";
+    json += "\"spo2\":" + String(p.spo2) + ",";
+    json += "\"temp\":" + String(p.temp, 1) + ",";
+    json += "\"lh\":" + String(p.hasVitals ? v.lh : 0) + ",";
+    json += "\"ls\":" + String(p.hasVitals ? v.ls : 0) + ",";
+    json += "\"lt\":" + String(p.hasVitals ? v.lt : 0) + ",";
+    json += "\"lv\":" + String(p.hasVitals ? v.lv : 0) + ",";
+    json += "\"why\":\"" + jsonEscape(p.hasVitals ? v.why : "") + "\",";
+    json += "\"ago\":" + String(ago) + ",";
+    json += "\"rssi\":" + String(p.rssi) + ",";
+    json += "\"alert\":" + String(p.alert);
     json += "}";
   }
 
   json += "]}";
 
-  server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
 }
 
@@ -759,12 +641,7 @@ void handleRegistration(const String &packet, int rssi) {
   Serial.println("================================");
 
   Serial.println("DATA : " + packet);
-
-  Serial.println(
-    "RSSI : " +
-    String(rssi) +
-    " dBm"
-  );
+  Serial.println("RSSI : " + String(rssi) + " dBm");
 
   int a = packet.indexOf('|');
   int b = packet.indexOf('|', a + 1);
@@ -777,28 +654,24 @@ void handleRegistration(const String &packet, int rssi) {
   String triage = sanitizeField(getField(packet, "TRIAGE"), 16);
 
   bool valid =
-    validSenseId(id) &&
+    id.length() > 0 &&
+    id.length() <= 20 &&
+    sanitizeField(id, 20) == id &&
     age.length() > 0 &&
     gender.length() > 0 &&
     status.length() > 0 &&
     triage.length() > 0;
 
   if (!valid) {
-
     Serial.println("[LINK] Registrasi tidak valid");
-
     sendLoRa("NACK|" + id + "|INVALID");
-
     Serial.println("================================");
     return;
   }
 
   if (!upsertPatient(id, age, gender, status, triage)) {
-
     Serial.println("[LINK] Penyimpanan penuh");
-
     sendLoRa("NACK|" + id + "|FULL");
-
     Serial.println("================================");
     return;
   }
@@ -814,89 +687,53 @@ void handleRegistration(const String &packet, int rssi) {
   Serial.println("================================");
 }
 
-
-// =====================================================
-// DATA DARI SENSE
-// =====================================================
-
-void handleSense(const String &packet, int rssi) {
+// Dari Sense
+void handleSenseData(const String &packet, int rssi) {
 
   int a = packet.indexOf('|');
   int b = packet.indexOf('|', a + 1);
 
   String id = (b > a) ? packet.substring(a + 1, b) : "";
 
-  String sHr   = getField(packet, "HR");
-  String sSpo2 = getField(packet, "SPO2");
-  String sTemp = getField(packet, "TEMP");
-
-  if (!validSenseId(id) ||
-      sHr.length() == 0 || sSpo2.length() == 0 || sTemp.length() == 0) {
-
-    Serial.println("[LINK] Paket SENSE tidak valid: " + packet);
-
+  if (id.length() == 0) {
     return;
   }
 
-  int idx = findPatient(id);
+  int idx = findOrCreatePatient(id);
 
   if (idx < 0) {
-    idx = addPatient(id);
-  }
-
-  if (idx < 0) {
-
-    Serial.println("[LINK] Daftar penuh, SENSE diabaikan: " + id);
-
+    Serial.println("[LINK] Data SENSE ditolak, penyimpanan penuh: " + id);
     return;
   }
 
   Patient &p = patients[idx];
 
-  p.hr       = sHr.toInt();
-  p.spo2     = sSpo2.toInt();
-  p.temp     = sTemp.toFloat();
-  p.rssi     = rssi;
-  p.lastSeen = millis();
-  p.hasVital = true;
-  p.packets++;
+  p.hasVitals = true;
+  p.hr = getField(packet, "HR").toInt();
+  p.spo2 = getField(packet, "SPO2").toInt();
+  p.temp = getField(packet, "TEMP").toFloat();
+  p.lastVitalsMs = millis();
+  p.rssi = rssi;
 
-  packetCount++;
+  VitalLevel v = classifyVitals(p.hr, p.spo2, p.temp);
 
-  evaluateVitals(idx);
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("[LINK] DATA VITAL DITERIMA");
+  Serial.println("================================");
+  Serial.println("ID   : " + id + (p.reg ? " (terdaftar)" : " (belum terdaftar)"));
+  Serial.println("HR   : " + String(p.hr) + " bpm");
+  Serial.println("SpO2 : " + String(p.spo2) + " %");
+  Serial.println("Suhu : " + String(p.temp, 1) + " C");
+  Serial.println("RSSI : " + String(rssi) + " dBm");
 
-  Serial.println(
-    "[LINK] " + id +
-    " HR=" + String(p.hr) +
-    " SpO2=" + String(p.spo2) +
-    " T=" + String(p.temp, 1) +
-    " | " + (p.registered ? p.age + ", " + p.gender : String("belum terdaftar")) +
-    " | level " + String(p.level) +
-    " | RSSI " + String(rssi) + " dBm"
-  );
-
-
-  // ---------------------------------------------------
-  // EMERGENCY KE LOG
-  // ---------------------------------------------------
-  if (p.level == 2) {
-
-    if (p.critStreak < 255) {
-      p.critStreak++;
-    }
-
-    if (p.critStreak >= ALERT_CONFIRM && p.alertState == 0) {
-
-      p.alertState = 1;
-      p.alertTries = 0;
-
-      sendAlert(idx);
-    }
-
-  } else {
-    p.critStreak = 0;
-    p.alertState = 0;
+  if (v.lv > 0) {
+    Serial.println("STATUS: " + v.why);
   }
+
+  Serial.println("================================");
+
+  updateEmergencyState(idx, v.lv);
 }
 
 void receiveLoRa() {
@@ -910,9 +747,7 @@ void receiveLoRa() {
   String received = "";
 
   while (LoRa.available()) {
-
     received += (char)LoRa.read();
-
   }
 
   received.trim();
@@ -923,36 +758,26 @@ void receiveLoRa() {
 
   int rssi = LoRa.packetRssi();
 
-
   if (received.startsWith("REG|")) {
-
     handleRegistration(received, rssi);
-
     return;
   }
 
-  if (received.startsWith("AACK|")) {
-
-    int idx = findPatient(received.substring(5));
-
-    if (idx >= 0 && patients[idx].alertState == 1) {
-
-      patients[idx].alertState = 2;
-
-      Serial.println("[LINK] LOG menerima ALERT " + patients[idx].id);
-    }
-
+  if (received.startsWith("EMACK|")) {
+    handleEmergencyAck(received);
     return;
   }
 
   if (received.startsWith("SENSE|")) {
-
-    handleSense(received, rssi);
-
+    packetCount++;
+    handleSenseData(received, rssi);
     return;
   }
 
-  Serial.println("[LINK] Paket tidak dikenal: " + received);
+  Serial.println(
+    "[RX] Paket tidak dikenal: " + received +
+    " | RSSI " + String(rssi) + " dBm"
+  );
 }
 
 void setup() {
@@ -961,20 +786,18 @@ void setup() {
 
   delay(1000);
 
-
   Serial.println();
   Serial.println("================================");
   Serial.println("        VITRA-LINK");
   Serial.println("================================");
 
+  bootMs = millis();
+
   prefs.begin("vitra", false);
 
   loadPatients();
 
-  Serial.println(
-    "[NVS] Pasien tersimpan: " +
-    String(patientCount)
-  );
+  Serial.println("[NVS] Pasien terdaftar: " + String(patientCount));
 
   SPI.begin(
     SPI_SCK,
@@ -983,69 +806,38 @@ void setup() {
     LORA_SS
   );
 
-  // LoRa Hell
-
   LoRa.setPins(
     LORA_SS,
     LORA_RST,
     LORA_DIO0
   );
 
-
   if (!LoRa.begin(LORA_FREQUENCY)) {
 
     Serial.println("[LoRa] GAGAL!");
 
     while (true) {
-
       delay(1000);
-
     }
-
   }
 
   LoRa.setSpreadingFactor(9);
-
   LoRa.setSignalBandwidth(125E3);
-
   LoRa.setCodingRate4(5);
-
   LoRa.enableCrc();
 
   Serial.println("[LoRa] OK");
 
-
-
   WiFi.mode(WIFI_AP);
-
-
   WiFi.softAP(AP_SSID, AP_PASSWORD);
 
+  Serial.println("[WiFi] SSID: " + String(AP_SSID));
+  Serial.println("[WiFi] IP: " + WiFi.softAPIP().toString());
 
-  Serial.println(
-    "[WiFi] SSID: " +
-    String(AP_SSID)
-  );
-
-  Serial.println(
-    "[WiFi] IP: " +
-    WiFi.softAPIP().toString()
-  );
-
-  server.on(
-    "/",
-    HTTP_GET,
-    handleRoot
-  );
-
-  server.on(
-    "/api/data",
-    HTTP_GET,
-    handleApiData
-  );
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/data", HTTP_GET, handleApiData);
 
   server.begin();
-
 
   Serial.println();
   Serial.println("================================");
@@ -1058,8 +850,6 @@ void setup() {
 void loop() {
   server.handleClient();
   receiveLoRa();
-  serviceAlerts();
-
 
   delay(5);
 }

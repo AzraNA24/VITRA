@@ -26,12 +26,17 @@
 #define BTN_SELECT 22
 #define BTN_LOG    12
 
+// UART dari modul ESP32-CAM (QR reader)
 #define QR_RX   16
 #define QR_TX   17
-#define QR_BAUD 9600
+#define QR_BAUD 115200
 
 #define REG_TIMEOUT_MS 4000
 #define REG_MAX_TRIES  3
+
+// =====================================================
+// UI GLOBALS (dipakai bersama oleh VITRALog_Setting.ino)
+// =====================================================
 
 uint16_t BG;
 uint16_t CARD;
@@ -49,17 +54,18 @@ Adafruit_ILI9341 tft(
 );
 
 // System State
-enum Mode {
+enum LogMode {
   M_HOME,
   M_SCAN,
   M_FORM,
   M_SEND,
   M_RESULT,
   M_LOG,
-  M_ALERT
+  M_EMERGENCY
 };
 
-Mode mode = M_HOME;
+LogMode mode = M_HOME;
+LogMode modeBeforeEmergency = M_HOME;
 
 bool loraReady = false;
 
@@ -70,28 +76,37 @@ String serBuf = "";
 int regTries = 0;
 unsigned long lastRegSend = 0;
 unsigned long resultUntil = 0;
+bool lastResultOk = false;
 
-// Alert emergency dari LINK
-#define MAX_ALERTS 5
-
-struct AlertInfo {
-  String id;
-  String hr;
-  String spo2;
-  String temp;
-  String why;      // alasan, dipisah '+'  (mis. "SpO2 rendah+HR tinggi")
-  String age;
-  String gender;
-  String status;
-  String triage;
+// form data (dipakai oleh VITRALog_Setting.ino)
+String fieldName[] = {
+  "AGE", "GENDER", "STATUS", "TRIAGE"
 };
 
-AlertInfo alerts[MAX_ALERTS];
+String selectedValue[] = {
+  "Anak-anak", "Pria", "Sadar", "Hijau"
+};
 
-int alertCount = 0;            // jumlah alert aktif
-int alertIdx = 0;              // alert yang sedang ditampilkan
-bool alertNew = false;         // ada alert baru yang belum ditampilkan
-Mode modeBeforeAlert = M_HOME; // layar yang dikembalikan setelah alert ditutup
+String options[][4] = {
+  { "Anak-anak", "Remaja", "Dewasa", "Lansia" },
+  { "Pria", "Wanita", "Unidentified" },
+  { "Sadar", "Bingung", "Tidak respon" },
+  { "Hijau", "Kuning" }
+};
+
+int optionCount[] = { 4, 3, 3, 2 };
+
+int currentField = 0;
+int optionIndex[4] = { 0, 0, 0, 0 };
+int currentPatient = 0;
+
+// Info darurat terakhir yang diterima dari VITRA LINK
+String emergId = "";
+String emergWhy = "";
+String emergHr = "";
+String emergSpo2 = "";
+String emergTemp = "";
+
 
 // Baca satu baris dari stream tanpa blocking
 bool pollLine(Stream &s, String &buf, String &out) {
@@ -139,8 +154,52 @@ bool validSenseId(const String &s) {
 }
 
 
+// Ambil nilai dari "|KEY=value" di dalam paket
+String getField(const String &packet, const String &key) {
+
+  String needle = "|" + key + "=";
+
+  int s = packet.indexOf(needle);
+
+  if (s < 0) {
+    return "";
+  }
+
+  s += needle.length();
+
+  int e = packet.indexOf('|', s);
+
+  if (e < 0) {
+    e = packet.length();
+  }
+
+  return packet.substring(s, e);
+}
+
+
+void resetForm() {
+  currentField = 0;
+
+  for (int i = 0; i < 4; i++) {
+    optionIndex[i] = 0;
+    selectedValue[i] = options[i][0];
+  }
+}
+
+void startForm() {
+  mode = M_FORM;
+  resetForm();
+  showForm();
+}
+
+void goHome() {
+  mode = M_HOME;
+  showHome();
+}
+
+
 // =====================================================
-// QR BUAT NANTI
+// QR
 // =====================================================
 
 void handleQR() {
@@ -161,6 +220,10 @@ void handleQR() {
 
   String line = "";
 
+  // Serial2 = kamera QR (GPIO16). Serial (USB) = jalur uji coba manual;
+  // ketik ID (mis. "VITRA-001") di Serial Monitor untuk mensimulasikan
+  // hasil scan selama kamera belum dipasang. Aman dibiarkan aktif terus,
+  // tidak mengganggu jalur kamera saat sudah terpasang.
   if (!pollLine(Serial2, qrBuf, line) &&
       !pollLine(Serial, serBuf, line)) {
     return;
@@ -184,10 +247,18 @@ void handleQR() {
   startForm();
 }
 
-void finishSend(bool ok) {
-  savePatient(ok);
 
+// =====================================================
+// REGISTRASI KE VITRA LINK
+// =====================================================
+
+void finishSend(bool ok) {
+  lastResultOk = ok;
+  logSavePatient(ok);
   showResult(ok);
+
+  mode = M_RESULT;
+  resultUntil = millis() + 1800;
 }
 
 
@@ -205,10 +276,10 @@ void sendRegistration() {
   String packet =
     "REG|" +
     senseId +
-    "|AGE=" + formValue(0) +
-    "|GENDER=" + formValue(1) +
-    "|STATUS=" + formValue(2) +
-    "|TRIAGE=" + formValue(3);
+    "|AGE=" + selectedValue[0] +
+    "|GENDER=" + selectedValue[1] +
+    "|STATUS=" + selectedValue[2] +
+    "|TRIAGE=" + selectedValue[3];
 
   regTries++;
 
@@ -225,7 +296,8 @@ void sendRegistration() {
 
   lastRegSend = millis();
 
-  showSending();
+  mode = M_SEND;
+  showSending(regTries);
 }
 
 
@@ -254,121 +326,43 @@ void checkAckTimeout() {
   }
 }
 
-// Ambil nilai dari "|KEY=value" di dalam paket
-String getField(const String &packet, const String &key) {
 
-  String needle = "|" + key + "=";
+// =====================================================
+// DARURAT DARI VITRA LINK
+// =====================================================
 
-  int s = packet.indexOf(needle);
+void handleEmergencyPacket(const String &received) {
 
-  if (s < 0) {
-    return "";
-  }
+  // Format: EMERG|<id>|HR=..|SPO2=..|TEMP=..|WHY=...
+  int a = received.indexOf('|');
+  int b = received.indexOf('|', a + 1);
 
-  s += needle.length();
+  String id = (b > a) ? received.substring(a + 1, b) : "";
 
-  int e = packet.indexOf('|', s);
-
-  if (e < 0) {
-    e = packet.length();
-  }
-
-  return packet.substring(s, e);
-}
-
-
-// Beri tahu LINK bahwa ALERT sudah diterima (LINK berhenti mengulang)
-void sendAlertAck(const String &id) {
-
-  if (!loraReady) {
+  if (id.length() == 0) {
     return;
   }
 
-  delay(50);   // beri waktu LINK kembali ke mode terima
+  emergId = id;
+  emergHr = getField(received, "HR");
+  emergSpo2 = getField(received, "SPO2");
+  emergTemp = getField(received, "TEMP");
+  emergWhy = getField(received, "WHY");
+  emergWhy.replace("_", " ");
 
+  Serial.println("[LOG] !!! DARURAT: " + emergId + " (" + emergWhy + ")");
+
+  // Balas konfirmasi supaya LINK berhenti mengirim ulang
   LoRa.beginPacket();
-  LoRa.print("AACK|" + id);
+  LoRa.print("EMACK|" + emergId);
   LoRa.endPacket();
-}
 
-
-// Format: ALERT|VITRA-001|HR=..|SPO2=..|TEMP=..|WHY=..|AGE=..|GENDER=..|STATUS=..|TRIAGE=..
-void handleAlert(const String &packet) {
-
-  int a = packet.indexOf('|');
-  int b = packet.indexOf('|', a + 1);
-
-  String id = (b > a) ? packet.substring(a + 1, b) : "";
-
-  if (!validSenseId(id)) {
-    return;
+  if (mode != M_EMERGENCY) {
+    modeBeforeEmergency = mode;
   }
 
-  sendAlertAck(id);
-
-  // Alert untuk pasien yang sama diperbarui, bukan ditambah
-  int idx = -1;
-
-  for (int i = 0; i < alertCount; i++) {
-
-    if (alerts[i].id == id) {
-      idx = i;
-      break;
-    }
-  }
-
-  bool isNew = (idx < 0);
-
-  if (isNew) {
-
-    if (alertCount >= MAX_ALERTS) {
-
-      // Penuh: buang yang paling lama
-      for (int i = 1; i < alertCount; i++) {
-        alerts[i - 1] = alerts[i];
-      }
-
-      alertCount--;
-    }
-
-    idx = alertCount++;
-  }
-
-  alerts[idx].id     = id;
-  alerts[idx].hr     = getField(packet, "HR");
-  alerts[idx].spo2   = getField(packet, "SPO2");
-  alerts[idx].temp   = getField(packet, "TEMP");
-  alerts[idx].why    = getField(packet, "WHY");
-  alerts[idx].age    = getField(packet, "AGE");
-  alerts[idx].gender = getField(packet, "GENDER");
-  alerts[idx].status = getField(packet, "STATUS");
-  alerts[idx].triage = getField(packet, "TRIAGE");
-
-  Serial.println("[LOG] EMERGENCY " + id + " : " + alerts[idx].why);
-
-  if (isNew) {
-
-    alertIdx = idx;
-    alertNew = true;
-
-  } else if (mode == M_ALERT && alertIdx == idx) {
-
-    showAlert();   // perbarui angka di layar
-  }
-}
-
-
-// Tampilkan alert. Layar sebelumnya diingat untuk dikembalikan nanti.
-void enterAlert() {
-
-  if (mode != M_ALERT) {
-    modeBeforeAlert = mode;
-    mode = M_ALERT;
-  }
-
-  clearButtonEvents();   // cegah tombol yang sedang ditekan langsung menutup alert
-
-  showAlert();
+  mode = M_EMERGENCY;
+  showEmergency();
 }
 
 
@@ -391,6 +385,11 @@ void receiveLoRa() {
   received.trim();
 
   if (received.length() == 0) {
+    return;
+  }
+
+  if (received.startsWith("EMERG|")) {
+    handleEmergencyPacket(received);
     return;
   }
 
@@ -418,28 +417,130 @@ void receiveLoRa() {
     return;
   }
 
-  if (received.startsWith("ALERT|")) {
-
-    Serial.println(
-      "[RX] " + received +
-      " | RSSI " + String(LoRa.packetRssi()) + " dBm"
-    );
-
-    handleAlert(received);
-
-    return;
-  }
-
-  // Data vital SENSE ikut terdengar langsung oleh LOG; tidak dipakai di sini
-  if (received.startsWith("SENSE|")) {
-    return;
-  }
-
   Serial.println(
     "[RX] " + received +
     " | RSSI " + String(LoRa.packetRssi()) + " dBm"
   );
 }
+
+
+// =====================================================
+// TOMBOL
+// =====================================================
+
+bool pressed(int pin) {
+
+  if (digitalRead(pin) == LOW) {
+    delay(150);
+    return true;
+  }
+
+  return false;
+}
+
+void handleButtons() {
+
+  // Layar darurat bisa ditutup dari mode APAPUN dengan tombol SELECT
+  if (mode == M_EMERGENCY) {
+    if (pressed(BTN_SELECT) || pressed(BTN_LOG)) {
+      mode = modeBeforeEmergency;
+
+      if (mode == M_HOME) showHome();
+      else if (mode == M_LOG) showLog();
+      else if (mode == M_FORM) showForm();
+      else if (mode == M_SCAN) showScan("WAITING FOR QR...");
+      else goHome();
+    }
+    return;
+  }
+
+  if (mode == M_HOME) {
+
+    if (pressed(BTN_SCAN)) {
+      senseId = "";
+      qrBuf = "";
+      mode = M_SCAN;
+      showScan("WAITING FOR QR...");
+    }
+
+    if (pressed(BTN_LOG)) {
+      mode = M_LOG;
+      currentPatient = 0;
+      showLog();
+    }
+
+  } else if (mode == M_LOG) {
+
+    if (pressed(BTN_LOG) || pressed(BTN_SELECT)) {
+      goHome();
+      return;
+    }
+
+    if (pressed(BTN_RIGHT)) {
+      DynamicJsonDocument doc = logLoadPatients();
+      JsonArray patients = doc.as<JsonArray>();
+
+      if (currentPatient < (int)patients.size() - 1) {
+        currentPatient++;
+      }
+
+      showLog();
+    }
+
+    if (pressed(BTN_LEFT)) {
+      if (currentPatient > 0) {
+        currentPatient--;
+      }
+      showLog();
+    }
+
+  } else if (mode == M_FORM) {
+
+    if (pressed(BTN_LEFT)) {
+      optionIndex[currentField]--;
+
+      if (optionIndex[currentField] < 0) {
+        optionIndex[currentField] = optionCount[currentField] - 1;
+      }
+      selectedValue[currentField] = options[currentField][optionIndex[currentField]];
+
+      showForm();
+    }
+
+    if (pressed(BTN_RIGHT)) {
+      optionIndex[currentField]++;
+
+      if (optionIndex[currentField] >= optionCount[currentField]) {
+        optionIndex[currentField] = 0;
+      }
+      selectedValue[currentField] = options[currentField][optionIndex[currentField]];
+
+      showForm();
+    }
+
+    if (pressed(BTN_SELECT)) {
+      if (currentField < 3) {
+        currentField++;
+        showForm();
+      } else {
+        regTries = 0;
+        sendRegistration();
+      }
+    }
+
+  } else if (mode == M_RESULT) {
+
+    // dibiarkan; auto-kembali ke HOME lewat timer di loop()
+
+  } else if (mode == M_SCAN || mode == M_SEND) {
+    // menunggu event QR / ACK; tombol diabaikan
+  }
+}
+
+
+// =====================================================
+// SETUP / LOOP
+// =====================================================
 
 void setup() {
 
@@ -502,7 +603,6 @@ void setup() {
     Serial.println("[LoRa] OK");
   }
 
-
   showHome();
 }
 
@@ -518,13 +618,6 @@ void loop() {
   handleQR();
 
   handleButtons();
-
-  // Alert baru menyela layar apa pun, kecuali saat registrasi sedang dikirim
-  // (supaya ACK dari LINK tidak terlewat). Ditampilkan begitu pengiriman selesai.
-  if (alertNew && mode != M_SEND) {
-    alertNew = false;
-    enterAlert();
-  }
 
   if (mode == M_RESULT && millis() >= resultUntil) {
     goHome();

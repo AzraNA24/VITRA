@@ -1,39 +1,19 @@
-//>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> 01 ESP32 Cam QR Code Scanner
-/*
- * Reference :
- * - ESP32-CAM QR Code Reader (off-line) : https://www.youtube.com/watch?v=ULZL37YqJc8
- * - ESP32QRCodeReader_Page : https://github.com/fustyles/Arduino/tree/master/ESP32-CAM_QRCode_Recognition/ESP32QRCodeReader_Page
- * 
- * The source of the "quirc" library I shared on this project: https://github.com/fustyles/Arduino/tree/master/ESP32-CAM_QRCode_Recognition/ESP32QRCodeReader_Page
- */
-
-/* ======================================== Including the libraries. */
 #include "esp_camera.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include "quirc.h"
-/* ======================================== */
 
 // creating a task handle
-TaskHandle_t QRCodeReader_Task; 
-
-/* ======================================== Select camera model */
-//#define CAMERA_MODEL_WROVER_KIT
-//#define CAMERA_MODEL_ESP_EYE
-//#define CAMERA_MODEL_M5STACK_PSRAM
-//#define CAMERA_MODEL_M5STACK_WITHOUT_PSRAM
-//#define CAMERA_MODEL_M5STACK_WITHOUT_PSRAM
+TaskHandle_t QRCodeReader_Task;
 #define CAMERA_MODEL_AI_THINKER
-/* ======================================== */
 
-/* ======================================== GPIO of camera models */
 #if defined(CAMERA_MODEL_WROVER_KIT)
   #define PWDN_GPIO_NUM    -1
   #define RESET_GPIO_NUM   -1
   #define XCLK_GPIO_NUM    21
   #define SIOD_GPIO_NUM    26
   #define SIOC_GPIO_NUM    27
-  
+
   #define Y9_GPIO_NUM      35
   #define Y8_GPIO_NUM      34
   #define Y7_GPIO_NUM      39
@@ -52,7 +32,7 @@ TaskHandle_t QRCodeReader_Task;
   #define XCLK_GPIO_NUM    4
   #define SIOD_GPIO_NUM    18
   #define SIOC_GPIO_NUM    23
-  
+
   #define Y9_GPIO_NUM      36
   #define Y8_GPIO_NUM      37
   #define Y7_GPIO_NUM      38
@@ -71,7 +51,7 @@ TaskHandle_t QRCodeReader_Task;
   #define XCLK_GPIO_NUM     27
   #define SIOD_GPIO_NUM     25
   #define SIOC_GPIO_NUM     23
-  
+
   #define Y9_GPIO_NUM       19
   #define Y8_GPIO_NUM       36
   #define Y7_GPIO_NUM       18
@@ -90,7 +70,7 @@ TaskHandle_t QRCodeReader_Task;
   #define XCLK_GPIO_NUM     27
   #define SIOD_GPIO_NUM     25
   #define SIOC_GPIO_NUM     23
-  
+
   #define Y9_GPIO_NUM       19
   #define Y8_GPIO_NUM       36
   #define Y7_GPIO_NUM       18
@@ -109,7 +89,7 @@ TaskHandle_t QRCodeReader_Task;
   #define XCLK_GPIO_NUM      0
   #define SIOD_GPIO_NUM     26
   #define SIOC_GPIO_NUM     27
-  
+
   #define Y9_GPIO_NUM       35
   #define Y8_GPIO_NUM       34
   #define Y7_GPIO_NUM       39
@@ -124,9 +104,7 @@ TaskHandle_t QRCodeReader_Task;
 #else
   #error "Camera model not selected"
 #endif
-/* ======================================== */
 
-/* ======================================== Variables declaration */
 struct QRCodeData
 {
   bool valid;
@@ -136,13 +114,19 @@ struct QRCodeData
 };
 
 struct quirc *q = NULL;
-uint8_t *image = NULL;  
+uint8_t *image = NULL;
 camera_fb_t * fb = NULL;
 struct quirc_code code;
 struct quirc_data data;
 quirc_decode_error_t err;
-struct QRCodeData qrCodeData;  
+struct QRCodeData qrCodeData;
 String QRCodeResult = "";
+
+// Anti-spam: jangan kirim ulang ID yang sama terus-menerus selagi kartu
+// masih di depan kamera; VITRA LOG cuma perlu satu kiriman per scan.
+String lastSentID = "";
+unsigned long lastSentAt = 0;
+const unsigned long RESEND_COOLDOWN_MS = 4000;
 /* ======================================== */
 
 /* ________________________________________________________________________________ VOID SETTUP() */
@@ -154,7 +138,9 @@ void setup() {
 
   /* ---------------------------------------- Init serial communication speed (baud rate). */
   Serial.begin(115200);
-  Serial.setDebugOutput(true);
+  // Matikan debug verbose bawaan ESP-IDF supaya jalur UART0 ke VITRA LOG
+  // hanya berisi hasil scan QR, bukan campur log sistem.
+  Serial.setDebugOutput(false);
   Serial.println();
   /* ---------------------------------------- */
 
@@ -184,7 +170,7 @@ void setup() {
   config.frame_size = FRAMESIZE_QVGA;
   config.jpeg_quality = 15;
   config.fb_count = 1;
-  
+
   #if defined(CAMERA_MODEL_ESP_EYE)
     pinMode(13, INPUT_PULLUP);
     pinMode(14, INPUT_PULLUP);
@@ -195,10 +181,10 @@ void setup() {
     Serial.printf("Camera init failed with error 0x%x", err);
     ESP.restart();
   }
-  
+
   sensor_t * s = esp_camera_sensor_get();
   s->set_framesize(s, FRAMESIZE_QVGA);
-  
+
   Serial.println("Configure and initialize the camera successfully.");
   Serial.println();
   /* ---------------------------------------- */
@@ -226,59 +212,78 @@ void loop() {
 void QRCodeReader( void * pvParameters ){
   /* ---------------------------------------- */
   Serial.println("QRCodeReader is ready.");
-  Serial.print("QRCodeReader running on core ");
-  Serial.println(xPortGetCoreID());
-  Serial.println();
   /* ---------------------------------------- */
 
   /* ---------------------------------------- Loop to read QR Code in real time. */
   while(1){
       q = quirc_new();
       if (q == NULL){
-        Serial.print("can't create quirc object\r\n");  
         continue;
       }
-    
+
       fb = esp_camera_fb_get();
       if (!fb)
       {
-        Serial.println("Camera capture failed");
         continue;
-      }   
-      
+      }
+
       quirc_resize(q, fb->width, fb->height);
       image = quirc_begin(q, NULL, NULL);
       memcpy(image, fb->buf, fb->len);
       quirc_end(q);
-      
+
       int count = quirc_count(q);
       if (count > 0) {
         quirc_extract(q, 0, &code);
         err = quirc_decode(&code, &data);
-    
-        if (err){
-          Serial.println("Decoding FAILED");
-          QRCodeResult = "";
-        } else {
+
+        if (!err){
           dumpData(&data);
-        } 
-        Serial.println();
-      } 
-      
+        }
+      }
+
       esp_camera_fb_return(fb);
       fb = NULL;
-      image = NULL;  
+      image = NULL;
       quirc_destroy(q);
   }
   /* ---------------------------------------- */
 }
 /* ________________________________________________________________________________ */
 
-/* ________________________________________________________________________________ Function to display the results of reading the QR Code on the serial monitor. */
+/* ________________________________________________________________________________ Function to send the decoded QR payload to VITRA LOG over UART0. */
 void dumpData(const struct quirc_data *data)
 {
-  QRCodeResult = (const char *)data->payload;
+  // data->payload tidak dijamin null-terminated di semua kasus, jadi
+  // dibatasi dengan payload_len yang sudah dihitung quirc.
+  String result;
+  result.reserve(data->payload_len + 1);
 
-  Serial.println(QRCodeResult);
+  for (int i = 0; i < data->payload_len; i++) {
+    result += (char)data->payload[i];
+  }
+  result.trim();
+
+  if (result.length() == 0) {
+    return;
+  }
+
+  // Hanya proses QR yang formatnya sesuai ID VITRA SENSE
+  if (!result.startsWith("VITRA")) {
+    return;
+  }
+
+  QRCodeResult = result;
+
+  unsigned long now = millis();
+  bool sameAsBefore = (result == lastSentID) && (now - lastSentAt < RESEND_COOLDOWN_MS);
+
+  if (sameAsBefore) {
+    return; 
+  }
+
+  Serial.println(result);
+
+  lastSentID = result;
+  lastSentAt = now;
 }
-
