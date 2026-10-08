@@ -211,14 +211,19 @@ void showEmergency() {
   tft.print("Tekan SELECT untuk tutup");
 }
 
+
 void showLog() {
+
   tft.fillScreen(BG);
   drawHeader();
 
   DynamicJsonDocument doc = logLoadPatients();
   JsonArray patients = doc.as<JsonArray>();
 
-  if (patients.size() == 0) {
+  int total = patients.size();
+  const int pageSize = 6;
+
+  if (total == 0) {
     tft.setTextColor(TEXT);
     tft.setTextSize(2);
     tft.setCursor(90, 120);
@@ -226,6 +231,20 @@ void showLog() {
     return;
   }
 
+  int totalPages = (total + pageSize - 1) / pageSize;
+
+  // currentPatient sekarang menyimpan index awal halaman
+  currentPatient = (currentPatient / pageSize) * pageSize;
+
+  if (currentPatient >= total) {
+    currentPatient = (totalPages - 1) * pageSize;
+  }
+
+  int currentPage = currentPatient / pageSize;
+  int startIndex = currentPage * pageSize;
+  int endIndex = min(startIndex + pageSize, total);
+
+  // Table header
   drawCard(10, 55, 300, 30, CARD);
 
   tft.setTextColor(TEXT);
@@ -240,32 +259,54 @@ void showLog() {
 
   int y = 100;
 
-  for (int i = 0; i < (int)patients.size(); i++) {
+  // Hanya tampilkan 6 pasien per halaman
+  for (int i = startIndex; i < endIndex; i++) {
+
     JsonObject patient = patients[i];
 
     tft.setTextSize(1);
-    tft.setTextColor(i == currentPatient ? PRIMARY : TEXT);
+    tft.setTextColor(TEXT);
 
     String id = patient["id"].as<String>();
-    String shortID = id.startsWith("VITRA-") ? id.substring(6) : id;
+    String shortID =
+      id.startsWith("VITRA-") ? id.substring(6) : id;
 
-    tft.setCursor(20, y);  tft.print(shortID);
-    tft.setCursor(75, y);  tft.print(shortAge(patient["age"].as<String>()));
-    tft.setCursor(120, y); tft.print(shortGender(patient["gender"].as<String>()));
-    tft.setCursor(160, y); tft.print(shortStatus(patient["status"].as<String>()));
-    tft.setCursor(210, y); tft.print(shortTriage(patient["triage"].as<String>()));
-    tft.setCursor(255, y); tft.print(patient["ok"].as<bool>() ? "OK" : "X");
+    tft.setCursor(20, y);
+    tft.print(shortID);
+
+    tft.setCursor(75, y);
+    tft.print(shortAge(patient["age"].as<String>()));
+
+    tft.setCursor(120, y);
+    tft.print(shortGender(patient["gender"].as<String>()));
+
+    tft.setCursor(160, y);
+    tft.print(shortStatus(patient["status"].as<String>()));
+
+    tft.setCursor(210, y);
+    tft.print(shortTriage(patient["triage"].as<String>()));
+
+    tft.setCursor(255, y);
+    tft.print(patient["ok"].as<bool>() ? "OK" : "X");
 
     y += 20;
-
-    if (y > 220) break;
   }
 
+  // Footer
+  tft.setTextSize(1);
   tft.setTextColor(SECONDARY);
-  tft.setCursor(110, 225);
+
+  tft.setCursor(20, 225);
   tft.print("TOTAL: ");
-  tft.print(patients.size());
+  tft.print(total);
+
+  tft.setCursor(235, 225);
+  tft.print("PAGE ");
+  tft.print(currentPage + 1);
+  tft.print("/");
+  tft.print(totalPages);
 }
+
 
 // Dicache a bit
 DynamicJsonDocument logLoadPatients() {
@@ -287,53 +328,121 @@ DynamicJsonDocument logLoadPatients() {
 
 void logSavePatient(bool ok) {
 
-  File file = LittleFS.open("/patients.json", "r");
+  String newID = senseId;
+  newID.trim();
 
-  DynamicJsonDocument doc(4096);
-
-  if (file) {
-    deserializeJson(doc, file);
-    file.close();
+  if (newID.isEmpty()) {
+    Serial.println("[FS] ID kosong");
+    return;
   }
 
-  if (!doc.is<JsonArray>()) {
+  DynamicJsonDocument doc(4096);
+  File file = LittleFS.open("/patients.json", "r");
+
+  if (file) {
+    DeserializationError error = deserializeJson(doc, file);
+    file.close();
+
+    if (error) {
+      Serial.println("[FS] JSON ERROR");
+      return;
+    }
+  }
+
+  if (doc.isNull()) {
     doc.to<JsonArray>();
   }
 
-  JsonArray patients = doc.as<JsonArray>();
-  bool found = false;
+  if (!doc.is<JsonArray>()) {
+    Serial.println("[FS] Format JSON tidak valid");
+    return;
+  }
 
-  for (JsonObject patient : patients) {
-    if (patient["id"] == senseId) {
-      patient["age"] = selectedValue[0];
-      patient["gender"] = selectedValue[1];
-      patient["status"] = selectedValue[2];
-      patient["triage"] = selectedValue[3];
-      patient["ok"] = ok;
-      found = true;
+  JsonArray patients = doc.as<JsonArray>();
+
+  int foundIndex = -1;
+
+  // Cari ID yang sudah ada
+  for (int i = 0; i < (int)patients.size(); i++) {
+    String oldID = patients[i]["id"].as<String>();
+    oldID.trim();
+
+    if (oldID == newID) {
+      foundIndex = i;
       break;
     }
   }
 
-  if (!found) {
-    JsonObject patient = patients.createNestedObject();
-    patient["id"] = senseId;
-    patient["age"] = selectedValue[0];
-    patient["gender"] = selectedValue[1];
-    patient["status"] = selectedValue[2];
-    patient["triage"] = selectedValue[3];
-    patient["ok"] = ok;
+  if (foundIndex == -1) {
+    // Pasien baru
+    foundIndex = patients.size();
+    patients.createNestedObject();
+
+    Serial.println("[FS] NEW PATIENT: " + newID);
+
+  } else {
+    // Hapus duplikat ID dari belakang
+    for (int i = (int)patients.size() - 1;
+         i > foundIndex; i--) {
+
+      String oldID = patients[i]["id"].as<String>();
+      oldID.trim();
+
+      if (oldID == newID) {
+        patients.remove(i);
+      }
+    }
+
+    Serial.println("[FS] PATIENT UPDATED: " + newID);
   }
 
-  file = LittleFS.open("/patients.json", "w");
+  // Overwrite informasi pasien
+  JsonObject patient = patients[foundIndex];
 
-  if (!file) {
-    Serial.println("[FS] GAGAL BUKA FILE UNTUK MENULIS");
+  patient["id"] = newID;
+  patient["age"] = selectedValue[0];
+  patient["gender"] = selectedValue[1];
+  patient["status"] = selectedValue[2];
+  patient["triage"] = selectedValue[3];
+  patient["ok"] = ok;
+
+  if (doc.overflowed()) {
+    Serial.println("[FS] JSON capacity exceeded");
     return;
   }
 
-  serializeJson(doc, file);
+  // Simpan kembali ke LittleFS
+  file = LittleFS.open("/patients.json", "w");
+
+  if (!file) {
+    Serial.println("[FS] WRITE ERROR");
+    return;
+  }
+
+  size_t written = serializeJson(doc, file);
   file.close();
 
-  Serial.println("[FS] Log lokal diperbarui (" + senseId + ")");
+  if (written == 0) {
+    Serial.println("[FS] SAVE ERROR");
+    return;
+  }
+
+  Serial.println("[FS] SAVE SUCCESS: " + newID);
 }
+
+
+void resetPatientLog() {
+
+  if (LittleFS.exists("/patients.json")) {
+
+    if (LittleFS.remove("/patients.json")) {
+      Serial.println("[FS] ALL PATIENT DATA DELETED");
+    } else {
+      Serial.println("[FS] DELETE FAILED");
+    }
+
+  } else {
+    Serial.println("[FS] NO PATIENT DATA");
+  }
+}
+

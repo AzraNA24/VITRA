@@ -476,23 +476,31 @@ void handleButtons() {
       return;
     }
 
+    // Halaman berikutnya
     if (pressed(BTN_RIGHT)) {
+
       DynamicJsonDocument doc = logLoadPatients();
       JsonArray patients = doc.as<JsonArray>();
 
-      if (currentPatient < (int)patients.size() - 1) {
-        currentPatient++;
+      if (currentPatient + 6 < (int)patients.size()) {
+        currentPatient += 6;
       }
 
       showLog();
+      return;
     }
 
+    // Halaman sebelumnya
     if (pressed(BTN_LEFT)) {
-      if (currentPatient > 0) {
-        currentPatient--;
+
+      if (currentPatient >= 6) {
+        currentPatient -= 6;
       }
+
       showLog();
+      return;
     }
+
 
   } else if (mode == M_FORM) {
 
@@ -532,8 +540,30 @@ void handleButtons() {
 
     // dibiarkan; auto-kembali ke HOME lewat timer di loop()
 
-  } else if (mode == M_SCAN || mode == M_SEND) {
-    // menunggu event QR / ACK; tombol diabaikan
+  } else if (mode == M_SCAN) {
+    // Tombol SCAN untuk kembali ke HOME
+    if (pressed(BTN_SCAN)) {
+      senseId = "";
+      qrBuf = "";
+      serBuf = "";
+
+      goHome();
+      return;
+    }
+
+    // Tombol SELECT untuk simulasi QR
+    if (pressed(BTN_SELECT)) {
+      senseId = "VITRA-002";
+      qrBuf = "";
+      serBuf = "";
+
+      Serial.println("[TEST] ID simulasi: " + senseId);
+
+      startForm();
+      return;
+    }
+  } else if (mode == M_SEND) {
+  // Menunggu ACK dari VITRA LINK
   }
 }
 
