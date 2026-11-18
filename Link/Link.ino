@@ -23,38 +23,28 @@ const char* AP_PASSWORD = "12345678";
 
 #define LORA_FREQUENCY 433E6
 
+// SF HARUS SAMA di Sense, Link, dan Log
+#define LORA_SF 9
 
-// normal HR 70-100 / SpO2 95-100 / Temp 36.0-38.0
-// darurat HR 140-160 / SpO2 82-88 / Temp 39.6-40.5)
-// Ionno nanti gimana. Ganti aja. :v
-
-#define HR_WARN_HI 100
-#define HR_WARN_LO 60
-#define HR_CRIT_HI 130
-#define HR_CRIT_LO 50
-
-#define SPO2_WARN 95
-#define SPO2_CRIT 90
-
-#define TEMP_WARN 37.8
-#define TEMP_CRIT 39.0
-#define TEMP_CRIT_LO 35.0
-
-#define OFFLINE_S 15
-
-#define EMERG_RESEND_MS 4000
+#include "vitra_radio.h"
 
 
 // -----------------------------------------------------
-// Web Server
+// Konfigurasi
+// -----------------------------------------------------
+
+#define MAX_PATIENTS    60     // termasuk pasien simulasi
+#define EMERG_RESEND_MS 4000   // kirim ulang EMERG ke LOG selagi belum di-EMACK
+#define TX_QUEUE_SIZE   8
+#define LINK_VERBOSE    1      // 1 = satu baris log per paket SENSE, 0 = hanya kejadian penting
+#define LINK_TEST_TOOLS 1      // 1 = aktifkan /stats dan /api/sim (matikan untuk produksi)
+
+
+// -----------------------------------------------------
+// Data
 // -----------------------------------------------------
 
 WebServer server(80);
-
-unsigned long packetCount = 0;
-unsigned long bootMs = 0;
-
-#define MAX_PATIENTS 20
 
 struct Patient {
   String id;
@@ -67,18 +57,51 @@ struct Patient {
   float temp = 0;
   unsigned long lastVitalsMs = 0;
   int rssi = 0;
+  int lastLevel = 0;
+  bool done = false;         // sesi Sense selesai (pengiriman terjadwal terakhir bertanda LAST=1)
 
-  // 0 = tidak ada, 1 = terkirim menunggu ACK, 2 = di-ACK LOG
-  int alert = 0; 
+  int alert = 0; // 0 = tidak ada, 1 = terkirim menunggu EMACK, 2 = di-EMACK LOG
   unsigned long lastEmergMs = 0;
+
+  int lastSeq = -1;          // nomor urut paket SENSE terakhir (untuk hitung paket hilang)
+
+  bool sim = false;          // pasien simulasi (tidak disimpan ke NVS)
+  uint8_t simClass = 0;
+  uint32_t simNext = 0;
+};
+
+struct TxItem {
+  String msg;
+  uint8_t prio;
 };
 
 Patient patients[MAX_PATIENTS];
 int patientCount = 0;
 
+TxItem txq[TX_QUEUE_SIZE];
+int txCount = 0;
+uint32_t txDropped = 0;
+
 Preferences prefs;
 
-// Besih-bersih
+unsigned long bootMs = 0;
+unsigned long packetCount = 0;      // semua paket SENSE yang diproses (RF + simulasi)
+
+// Statistik untuk pengujian
+uint32_t rfSense = 0, rfReg = 0, rfEmack = 0, rfOther = 0;
+uint32_t rfSeqRx = 0, rfLost = 0;
+uint32_t simPackets = 0;
+uint32_t rfProcUsAvg = 0;
+uint32_t apiCalls = 0, apiUsAvg = 0, apiUsMax = 0, apiBytesLast = 0;
+uint32_t loopGapMaxUs = 0;
+
+// Simulator
+bool simOn = false;
+uint32_t simMs = 1000;
+bool simTx = false;
+
+
+// Buang karakter yang bisa merusak format paket atau HTML
 String sanitizeField(String s, size_t maxLen) {
 
   String out = "";
@@ -105,6 +128,8 @@ String sanitizeField(String s, size_t maxLen) {
   return out;
 }
 
+
+// Ambil nilai dari "|KEY=value" di dalam paket
 String getField(const String &packet, const String &key) {
 
   String needle = "|" + key + "=";
@@ -127,13 +152,85 @@ String getField(const String &packet, const String &key) {
 }
 
 
-void sendLoRa(const String &msg) {
-  delay(50);
+// =====================================================
+// ANTRIAN KIRIM BERPRIORITAS
+// Handler tidak pernah memancar langsung; mereka hanya mengantre,
+// lalu loop() mengirim item berprioritas tertinggi lebih dulu.
+// =====================================================
 
-  LoRa.beginPacket();
-  LoRa.print(msg);
-  LoRa.endPacket();
+bool txHas(const String &prefix) {
+
+  for (int i = 0; i < txCount; i++) {
+    if (txq[i].msg.startsWith(prefix)) {
+      return true;
+    }
+  }
+
+  return false;
 }
+
+
+void txEnqueue(const String &msg, uint8_t prio) {
+
+  if (txCount >= TX_QUEUE_SIZE) {
+
+    // Penuh: buang item berprioritas terendah. Kalau yang baru tidak lebih penting, buang yang baru.
+    int worst = 0;
+
+    for (int i = 1; i < txCount; i++) {
+      if (txq[i].prio >= txq[worst].prio) {
+        worst = i;
+      }
+    }
+
+    txDropped++;
+
+    if (txq[worst].prio <= prio) {
+      return;
+    }
+
+    for (int i = worst; i < txCount - 1; i++) {
+      txq[i] = txq[i + 1];
+    }
+
+    txCount--;
+  }
+
+  txq[txCount].msg = msg;
+  txq[txCount].prio = prio;
+  txCount++;
+}
+
+
+void txPump() {
+
+  if (txCount == 0) {
+    return;
+  }
+
+  int best = 0;
+
+  for (int i = 1; i < txCount; i++) {
+    if (txq[i].prio < txq[best].prio) {
+      best = i;
+    }
+  }
+
+  TxItem item = txq[best];
+
+  for (int i = best; i < txCount - 1; i++) {
+    txq[i] = txq[i + 1];
+  }
+
+  txCount--;
+
+  vitraSend(item.msg, item.prio);
+}
+
+
+// =====================================================
+// DATA PASIEN (identitas registrasi -- persisten di NVS)
+// =====================================================
 
 void savePatients() {
 
@@ -141,7 +238,8 @@ void savePatients() {
 
   for (int i = 0; i < patientCount; i++) {
 
-    if (!patients[i].reg) continue;
+    if (!patients[i].reg || patients[i].sim) continue;   // hanya pasien nyata yang teregistrasi
+
     s += patients[i].id + "|" +
          patients[i].age + "|" +
          patients[i].gender + "|" +
@@ -206,6 +304,8 @@ int findPatient(const String &id) {
   return -1;
 }
 
+
+// Cari slot pasien, buat baru (belum teregistrasi) kalau belum ada
 int findOrCreatePatient(const String &id) {
 
   int idx = findPatient(id);
@@ -227,6 +327,9 @@ int findOrCreatePatient(const String &id) {
 
 
 // Tambah pasien baru atau timpa data registrasi lama dengan ID Sense yang sama
+// (data vital yang sudah ada TIDAK dihapus)
+bool regChanged = false;   // true kalau upsert terakhir menambah / mengubah data pasien
+
 bool upsertPatient(const String &id, const String &age,
                    const String &gender, const String &status,
                    const String &triage) {
@@ -236,6 +339,11 @@ bool upsertPatient(const String &id, const String &age,
   if (idx < 0) {
     return false;
   }
+
+  Patient &old = patients[idx];
+
+  regChanged = !old.reg || old.age != age || old.gender != gender ||
+               old.status != status || old.triage != triage;
 
   patients[idx].reg    = true;
   patients[idx].age    = age;
@@ -248,51 +356,10 @@ bool upsertPatient(const String &id, const String &age,
   return true;
 }
 
-struct VitalLevel {
-  int lh, ls, lt, lv;
-  String why;
-};
 
-VitalLevel classifyVitals(int hr, int spo2, float temp) {
-
-  VitalLevel v;
-  v.lh = 0; v.ls = 0; v.lt = 0;
-
-  String why = "";
-
-  if (hr >= HR_CRIT_HI || hr <= HR_CRIT_LO) {
-    v.lh = 2;
-    why += "HR Kritis+";
-  } else if (hr >= HR_WARN_HI || hr <= HR_WARN_LO) {
-    v.lh = 1;
-    why += "HR Waspada+";
-  }
-
-  if (spo2 <= SPO2_CRIT) {
-    v.ls = 2;
-    why += "SpO2 Kritis+";
-  } else if (spo2 <= SPO2_WARN) {
-    v.ls = 1;
-    why += "SpO2 Waspada+";
-  }
-
-  if (temp >= TEMP_CRIT || temp <= TEMP_CRIT_LO) {
-    v.lt = 2;
-    why += "Suhu Kritis+";
-  } else if (temp >= TEMP_WARN) {
-    v.lt = 1;
-    why += "Suhu Waspada+";
-  }
-
-  if (why.endsWith("+")) {
-    why.remove(why.length() - 1);
-  }
-
-  v.why = why;
-  v.lv = max(v.lh, max(v.ls, v.lt));
-
-  return v;
-}
+// =====================================================
+// DARURAT -- kirim & kelola alert ke VITRA LOG
+// =====================================================
 
 void updateEmergencyState(int idx, int lv) {
 
@@ -305,26 +372,31 @@ void updateEmergencyState(int idx, int lv) {
 
     if (needSend) {
 
-      VitalLevel v = classifyVitals(p.hr, p.spo2, p.temp);
-      String whyEsc = v.why;
-      whyEsc.replace(" ", "_");
+      VitalLevel v = vitraClassify(p.hr, p.spo2, p.temp);
 
-      String packet =
-        "EMERG|" + p.id +
-        "|HR=" + String(p.hr) +
-        "|SPO2=" + String(p.spo2) +
-        "|TEMP=" + String(p.temp, 1) +
-        "|WHY=" + whyEsc;
+      char why[48];
+      vitraWhy(v, why, sizeof(why));
 
-      Serial.println("[LINK] >>> KIRIM DARURAT ke LOG: " + packet);
+      for (char *c = why; *c; c++) {
+        if (*c == ' ') *c = '_';
+      }
 
-      sendLoRa(packet);
+      char pkt[120];
+      snprintf(pkt, sizeof(pkt), "EMERG|%s|HR=%d|SPO2=%d|TEMP=%.1f|WHY=%s",
+               p.id.c_str(), p.hr, p.spo2, (double)p.temp, why);
+
+      // Jangan menumpuk EMERG yang sama di antrian
+      if (!txHas("EMERG|" + p.id + "|")) {
+        txEnqueue(String(pkt), PRIO_CRIT);
+        Serial.println("[LINK] >>> DARURAT dijadwalkan ke LOG: " + String(pkt));
+      }
 
       p.alert = 1;
       p.lastEmergMs = millis();
     }
 
   } else {
+    // Pasien sudah tidak kritis lagi -> reset supaya episode berikutnya memicu alert baru
     if (p.alert != 0) {
       p.alert = 0;
     }
@@ -333,6 +405,7 @@ void updateEmergencyState(int idx, int lv) {
 
 
 void handleEmergencyAck(const String &packet) {
+  // Format: EMACK|<id>
   String id = packet.substring(String("EMACK|").length());
 
   int idx = findPatient(id);
@@ -347,9 +420,74 @@ void handleEmergencyAck(const String &packet) {
 }
 
 
+// Data Sense kini jarang datang (tiap 15 menit), jadi pengulangan EMERG yang belum
+// di-EMACK tidak boleh menunggu paket Sense berikutnya. Dipanggil dari loop().
+void emergencyTick() {
+
+  for (int i = 0; i < patientCount; i++) {
+
+    Patient &p = patients[i];
+
+    if (p.sim || p.alert != 1 || !p.hasVitals) {
+      continue;
+    }
+
+    updateEmergencyState(i, vitraClassify(p.hr, p.spo2, p.temp).lv);
+  }
+}
+
+
 // =====================================================
-// WEB PAGE
+// TERAPKAN DATA VITAL (dipakai paket RF maupun simulator)
 // =====================================================
+
+void applyVitals(int idx, int hr, int spo2, float temp, int rssi, int seq, bool allowTx) {
+
+  Patient &p = patients[idx];
+
+  // Hitung paket hilang dari celah nomor urut (modulo 256)
+  if (seq >= 0) {
+
+    if (p.lastSeq >= 0) {
+
+      int d = (seq - p.lastSeq) & 0xFF;
+
+      if (d > 1 && d < 128) {
+        rfLost += d - 1;
+      }
+    }
+
+    p.lastSeq = seq;
+    rfSeqRx++;
+  }
+
+  p.hasVitals = true;
+  p.hr = hr;
+  p.spo2 = spo2;
+  p.temp = temp;
+  p.lastVitalsMs = millis();
+  p.rssi = rssi;
+
+  VitalLevel v = vitraClassify(hr, spo2, temp);
+
+  if (v.lv != p.lastLevel) {
+    Serial.printf("[LINK] %s level %d -> %d\n", p.id.c_str(), p.lastLevel, v.lv);
+    p.lastLevel = v.lv;
+  }
+
+#if LINK_VERBOSE
+  if (!p.sim) {
+    Serial.printf("[SENSE] %-10s HR=%3d SpO2=%3d T=%4.1f L%d %4ddBm q=%d %s\n",
+                  p.id.c_str(), hr, spo2, (double)temp, v.lv, rssi, seq,
+                  p.reg ? "" : "(belum terdaftar)");
+  }
+#endif
+
+  if (allowTx) {
+    updateEmergencyState(idx, v.lv);
+  }
+}
+
 
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -385,12 +523,14 @@ h1 span{color:var(--pri)}
 .card.warn{border-left-color:var(--warn)}
 .card.crit{border-color:var(--crit);border-left-color:var(--crit);box-shadow:0 0 0 1px var(--crit) inset}
 .card.off,.card.wait{border-left-color:var(--muted);opacity:.75}
+.card.done{border-left-color:var(--pri);opacity:.85}
 .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
 .pid{font-weight:700;font-size:18px}
 .pill{font-size:11px;font-weight:700;padding:3px 9px;border-radius:99px;background:var(--ok);color:#06210f}
 .pill.warn{background:var(--warn);color:#2b1d00}
 .pill.crit{background:var(--crit);color:#fff}
 .pill.off,.pill.wait{background:var(--muted);color:#0a121e}
+.pill.done{background:var(--pri);color:#fff}
 .info{color:var(--muted);font-size:13px;margin-bottom:10px}
 .tri{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;font-weight:600;margin-left:6px;color:#111}
 .tri.Hijau{background:var(--ok)}
@@ -429,6 +569,7 @@ h1 span{color:var(--pri)}
   <div class="chip c"><b id="n_crit">0</b><span>Kritis</span></div>
   <div class="chip w"><b id="n_warn">0</b><span>Waspada</span></div>
   <div class="chip o"><b id="n_ok">0</b><span>Normal</span></div>
+  <div class="chip"><b id="n_done">0</b><span>Selesai</span></div>
   <div class="chip"><b id="n_off">0</b><span>Offline / menunggu</span></div>
 </div>
 
@@ -438,11 +579,11 @@ h1 span{color:var(--pri)}
 
 <script>
 const $ = id => document.getElementById(id);
-const OFFLINE_S = 15;
+let OFFLINE_S = 40;   // diisi dari server (d.off)
 const ESC = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
 const esc = s => String(s).replace(/[&<>"']/g, c => ESC[c]);
 const ALERT_TXT = ['', 'menunggu konfirmasi LOG\u2026', 'diterima VITRA LOG \u2713'];
-const RANK = {crit:0, warn:1, off:2, wait:3, ok:4};
+const RANK = {crit:0, warn:1, off:2, wait:3, ok:4, done:5};
 
 function fmtAgo(s){
   if (s < 60) return s + ' dtk lalu';
@@ -458,6 +599,7 @@ function fmtUp(s){
 // [kelas css, label]
 function state(p){
   if (p.lv === 2) return ['crit', 'KRITIS'];
+  if (p.done) return ['done', 'SESI SELESAI'];
   if (!p.hasv) return ['wait', 'MENUNGGU SENSE'];
   if (p.ago > OFFLINE_S) return ['off', 'SENSE OFFLINE'];
   if (p.lv === 1) return ['warn', 'WASPADA'];
@@ -471,7 +613,7 @@ function tile(label, val, unit, lv){
 
 function card(p){
   const st = state(p);
-  const off = p.hasv && p.ago > OFFLINE_S;
+  const off = p.hasv && !p.done && p.ago > OFFLINE_S;
 
   const info = p.reg
     ? esc(p.age) + ' &middot; ' + esc(p.gender) + ' &middot; ' + esc(p.status) +
@@ -512,10 +654,11 @@ function card(p){
 }
 
 function render(d){
+  OFFLINE_S = d.off;
   const ps = d.patients.slice().sort((a, b) =>
     RANK[state(a)[0]] - RANK[state(b)[0]] || a.id.localeCompare(b.id));
 
-  const cnt = {crit:0, warn:0, ok:0, off:0, wait:0};
+  const cnt = {crit:0, warn:0, ok:0, off:0, wait:0, done:0};
   ps.forEach(p => cnt[state(p)[0]]++);
 
   $('n_all').textContent  = ps.length;
@@ -523,6 +666,7 @@ function render(d){
   $('n_warn').textContent = cnt.warn;
   $('n_ok').textContent   = cnt.ok;
   $('n_off').textContent  = cnt.off + cnt.wait;
+  $('n_done').textContent = cnt.done;
   $('pk').textContent     = d.packets;
   $('up').textContent     = fmtUp(d.uptime);
 
@@ -576,62 +720,418 @@ poll();
 </html>
 )rawliteral";
 
+#if LINK_TEST_TOOLS
+const char STATS_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VITRA LINK - Stats</title>
+<style>
+body{margin:0 auto;background:#0a121e;color:#f5f5f5;font:14px/1.4 system-ui,sans-serif;padding:16px;max-width:1000px}
+h1{font-size:20px;margin:0 0 12px}
+h2{font-size:12px;color:#8a96ab;text-transform:uppercase;letter-spacing:.5px;margin:18px 0 6px}
+.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
+.c{background:#192332;border:1px solid #26344a;border-radius:8px;padding:8px 12px}
+.c b{display:block;font-size:20px}
+.c span{color:#8a96ab;font-size:11px;text-transform:uppercase}
+table{width:100%;border-collapse:collapse}
+td,th{padding:4px 8px;border-bottom:1px solid #26344a;text-align:right}
+th:first-child,td:first-child{text-align:left}
+label{margin-right:12px;color:#8a96ab}
+input{width:70px;background:#101a29;color:#fff;border:1px solid #26344a;border-radius:6px;padding:4px}
+button{background:#1e8cf0;color:#fff;border:0;border-radius:6px;padding:6px 14px;cursor:pointer;margin-right:6px}
+button.s{background:#f04646}
+a{color:#1e8cf0;font-size:13px}
+</style></head><body>
+<h1>VITRA LINK &middot; Stats &amp; Uji Beban <a href="/">&larr; dashboard</a></h1>
+
+<h2>Simulasi pasien (tanpa perangkat Sense)</h2>
+<div>
+<label>Pasien <input id="n" type="number" value="20"></label>
+<label>Interval ms <input id="ms" type="number" value="1000"></label>
+<label>Kritis <input id="cr" type="number" value="2"></label>
+<label>Waspada <input id="wr" type="number" value="3"></label>
+<label><input id="tx" type="checkbox" style="width:auto"> kirim EMERG via LoRa</label>
+<br><br>
+<button onclick="sim(1)">Mulai</button><button class="s" onclick="sim(0)">Stop</button>
+<label>Viewer paralel <input id="vw" type="number" value="1" onchange="setViewers()"></label>
+</div>
+
+<h2>Latensi web (diukur di browser ini)</h2><div class="g" id="lat"></div>
+<h2>Kondisi Link</h2><div class="g" id="st"></div>
+<h2>Akses kanal LoRa per prioritas (Link sebagai pemancar)</h2><table id="tx2"></table>
+
+<script>
+const $=id=>document.getElementById(id);
+const cell=(l,v)=>'<div class="c"><b>'+v+'</b><span>'+l+'</span></div>';
+let rtt=[],viewers=[],stale=0,bytes=0,errs=0;
+
+function stat(a){
+  if(!a.length)return[0,0,0,0];
+  const s=a.slice().sort((x,y)=>x-y);
+  return[a[a.length-1],a.reduce((x,y)=>x+y,0)/a.length,s[Math.floor(s.length*.95)],s[s.length-1]];
+}
+
+async function pollData(){
+  const t=performance.now();
+  try{
+    const r=await fetch('/api/data',{cache:'no-store'});
+    const tx=await r.text();
+    const d=JSON.parse(tx);
+    rtt.push(performance.now()-t);
+    if(rtt.length>200)rtt.shift();
+    bytes=tx.length;
+    stale=Math.max(0,...d.patients.filter(p=>p.hasv).map(p=>p.ago));
+  }catch(e){errs++;}
+}
+
+function setViewers(){
+  viewers.forEach(clearInterval);viewers=[];
+  const k=Math.max(1,Math.min(20,+$('vw').value||1));
+  for(let i=0;i<k;i++)viewers.push(setInterval(pollData,1000));
+}
+
+async function sim(on){
+  const q=on?('n='+$('n').value+'&ms='+$('ms').value+'&crit='+$('cr').value+'&warn='+$('wr').value+'&tx='+($('tx').checked?1:0)):'stop=1';
+  await fetch('/api/sim?'+q);
+}
+
+async function pollStats(){
+  try{
+    const s=await(await fetch('/api/stats',{cache:'no-store'})).json();
+    const [l,a,p,m]=stat(rtt);
+    $('lat').innerHTML=
+      cell('RTT terakhir',l.toFixed(0)+' ms')+cell('RTT rata-rata',a.toFixed(0)+' ms')+
+      cell('RTT p95',p.toFixed(0)+' ms')+cell('RTT maks',m.toFixed(0)+' ms')+
+      cell('Ukuran /api/data',(bytes/1024).toFixed(1)+' KB')+
+      cell('Data tertua',stale+' dtk')+cell('Fetch gagal',errs)+
+      cell('Bangun JSON rata2',(s.api.usAvg/1000).toFixed(1)+' ms')+
+      cell('Bangun JSON maks',(s.api.usMax/1000).toFixed(1)+' ms');
+    const tot=s.rf.seqRx+s.rf.lost;
+    $('st').innerHTML=
+      cell('Uptime',s.uptime+' dtk')+cell('Heap bebas',(s.heap/1024).toFixed(0)+' KB')+
+      cell('Heap min',(s.heapMin/1024).toFixed(0)+' KB')+cell('Klien WiFi',s.clients)+
+      cell('Pasien (sim)',s.patients+' ('+s.sim+')')+
+      cell('Paket SENSE RF',s.rf.sense)+cell('REG',s.rf.reg)+cell('EMACK',s.rf.emack)+
+      cell('Paket simulasi',s.simPackets)+
+      cell('Paket hilang (RF)',tot?(100*s.rf.lost/tot).toFixed(1)+' %':'-')+
+      cell('Proses paket RF',s.proc.usAvg+' us')+
+      cell('Loop macet maks',(s.loopGapMaxUs/1000).toFixed(0)+' ms')+
+      cell('Antrian TX',s.tx.queue+' / drop '+s.tx.dropped);
+    const nm=['CRIT','WARN','REG','NORMAL'];
+    let h='<tr><th>Kelas</th><th>Terkirim</th><th>Ditunda</th><th>Dipaksa</th><th>Tunggu rata2</th><th>Tunggu maks</th></tr>';
+    for(let i=0;i<4;i++)h+='<tr><td>'+nm[i]+'</td><td>'+s.tx.sent[i]+'</td><td>'+s.tx.deferred[i]+'</td><td>'+s.tx.forced[i]+'</td><td>'+s.tx.waitAvg[i]+' ms</td><td>'+s.tx.waitMax[i]+' ms</td></tr>';
+    $('tx2').innerHTML=h;
+  }catch(e){}
+}
+
+setViewers();
+setInterval(pollStats,2000);
+pollStats();
+</script></body></html>
+)rawliteral";
+#endif
+
 
 void handleRoot() {
   server.send_P(200, "text/html", INDEX_HTML);
 }
 
-String jsonEscape(const String &s) {
-  String out = s;
-  out.replace("\\", "\\\\");
-  out.replace("\"", "\\\"");
-  return out;
+void handleStatsPage() {
+#if LINK_TEST_TOOLS
+  server.send_P(200, "text/html", STATS_HTML);
+#else
+  server.send(404, "text/plain", "off");
+#endif
+}
+
+
+// =====================================================
+// API DATA -- dialirkan per potongan (tanpa String raksasa)
+// =====================================================
+
+static char outBuf[1400];
+static size_t outLen = 0;
+static uint32_t outTotal = 0;
+
+void outFlush() {
+
+  if (outLen == 0) {
+    return;
+  }
+
+  outBuf[outLen] = 0;
+  server.sendContent(outBuf);
+  outTotal += outLen;
+  outLen = 0;
+}
+
+void outAdd(const char *s, size_t n) {
+
+  if (n >= sizeof(outBuf) - 1) {
+    return;
+  }
+
+  if (outLen + n >= sizeof(outBuf) - 1) {
+    outFlush();
+  }
+
+  memcpy(outBuf + outLen, s, n);
+  outLen += n;
 }
 
 void handleApiData() {
 
-  String json = "{";
+  uint32_t t0 = micros();
 
-  json += "\"packets\":" + String(packetCount) + ",";
-  json += "\"uptime\":" + String((millis() - bootMs) / 1000) + ",";
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
 
-  json += "\"patients\":[";
+  outLen = 0;
+  outTotal = 0;
+
+  char buf[512];
+
+  int n = snprintf(buf, sizeof(buf), "{\"packets\":%lu,\"uptime\":%lu,\"off\":%lu,\"patients\":[",
+                   (unsigned long)packetCount, (unsigned long)((millis() - bootMs) / 1000),
+                   (unsigned long)VITRA_OFFLINE_S);
+  outAdd(buf, n);
 
   for (int i = 0; i < patientCount; i++) {
 
     Patient &p = patients[i];
 
-    if (i > 0) json += ",";
+    VitalLevel v = vitraClassify(p.hr, p.spo2, p.temp);
 
-    VitalLevel v = classifyVitals(p.hr, p.spo2, p.temp);
+    if (!p.hasVitals) {
+      v.lh = v.ls = v.lt = v.lv = 0;
+    }
+
+    char why[48];
+    vitraWhy(v, why, sizeof(why));
+
     long ago = p.hasVitals ? (long)((millis() - p.lastVitalsMs) / 1000) : 0;
 
-    json += "{";
-    json += "\"id\":\"" + jsonEscape(p.id) + "\",";
-    json += "\"reg\":" + String(p.reg ? "true" : "false") + ",";
-    json += "\"age\":\"" + jsonEscape(p.age) + "\",";
-    json += "\"gender\":\"" + jsonEscape(p.gender) + "\",";
-    json += "\"status\":\"" + jsonEscape(p.status) + "\",";
-    json += "\"triage\":\"" + jsonEscape(p.triage) + "\",";
-    json += "\"hasv\":" + String(p.hasVitals ? "true" : "false") + ",";
-    json += "\"hr\":" + String(p.hr) + ",";
-    json += "\"spo2\":" + String(p.spo2) + ",";
-    json += "\"temp\":" + String(p.temp, 1) + ",";
-    json += "\"lh\":" + String(p.hasVitals ? v.lh : 0) + ",";
-    json += "\"ls\":" + String(p.hasVitals ? v.ls : 0) + ",";
-    json += "\"lt\":" + String(p.hasVitals ? v.lt : 0) + ",";
-    json += "\"lv\":" + String(p.hasVitals ? v.lv : 0) + ",";
-    json += "\"why\":\"" + jsonEscape(p.hasVitals ? v.why : "") + "\",";
-    json += "\"ago\":" + String(ago) + ",";
-    json += "\"rssi\":" + String(p.rssi) + ",";
-    json += "\"alert\":" + String(p.alert);
-    json += "}";
+    n = snprintf(buf, sizeof(buf),
+      "%s{\"id\":\"%s\",\"reg\":%s,\"age\":\"%s\",\"gender\":\"%s\",\"status\":\"%s\",\"triage\":\"%s\","
+      "\"hasv\":%s,\"hr\":%d,\"spo2\":%d,\"temp\":%.1f,\"lh\":%d,\"ls\":%d,\"lt\":%d,\"lv\":%d,"
+      "\"why\":\"%s\",\"ago\":%ld,\"rssi\":%d,\"alert\":%d,\"done\":%s}",
+      i > 0 ? "," : "",
+      p.id.c_str(), p.reg ? "true" : "false",
+      p.age.c_str(), p.gender.c_str(), p.status.c_str(), p.triage.c_str(),
+      p.hasVitals ? "true" : "false", p.hr, p.spo2, (double)p.temp,
+      v.lh, v.ls, v.lt, v.lv, why, ago, p.rssi, p.alert, p.done ? "true" : "false");
+
+    if (n > 0 && n < (int)sizeof(buf)) {
+      outAdd(buf, n);
+    }
   }
 
-  json += "]}";
+  outAdd("]}", 2);
+  outFlush();
+  server.sendContent("");      // akhiri respons chunked
 
-  server.send(200, "application/json", json);
+  uint32_t dt = micros() - t0;
+
+  apiCalls++;
+  apiUsAvg = (apiUsAvg * 7 + dt) / 8;
+  if (dt > apiUsMax) apiUsMax = dt;
+  apiBytesLast = outTotal;
 }
+
+
+// =====================================================
+// STATISTIK + SIMULATOR (alat uji)
+// =====================================================
+
+int simCount() {
+
+  int c = 0;
+
+  for (int i = 0; i < patientCount; i++) {
+    if (patients[i].sim) c++;
+  }
+
+  return c;
+}
+
+
+void simStop() {
+
+  int j = 0;
+
+  for (int i = 0; i < patientCount; i++) {
+
+    if (!patients[i].sim) {
+
+      if (i != j) {
+        patients[j] = patients[i];
+      }
+
+      j++;
+    }
+  }
+
+  for (int k = j; k < patientCount; k++) {
+    patients[k] = Patient();
+  }
+
+  patientCount = j;
+  simOn = false;
+}
+
+
+void simStart(int n, uint32_t ms, int crit, int warn, bool tx) {
+
+  static const char *AGES[]   = { "Anak-anak", "Remaja", "Dewasa", "Lansia" };
+  static const char *GENDERS[] = { "Pria", "Wanita" };
+  static const char *STATUSES[] = { "Sadar", "Bingung", "Tidak respon" };
+  static const char *TRIAGES[] = { "Hijau", "Kuning" };
+
+  simStop();
+
+  if (n < 1) n = 1;
+
+  int room = MAX_PATIENTS - patientCount;
+
+  if (n > room) n = room;
+
+  if (ms < 100) ms = 100;
+
+  for (int i = 0; i < n; i++) {
+
+    int idx = patientCount++;
+
+    patients[idx] = Patient();
+
+    char id[16];
+    snprintf(id, sizeof(id), "SIM-%03d", i + 1);
+
+    Patient &p = patients[idx];
+
+    p.id = id;
+    p.sim = true;
+    p.reg = true;
+    p.age = AGES[random(4)];
+    p.gender = GENDERS[random(2)];
+    p.status = STATUSES[random(3)];
+    p.triage = TRIAGES[random(2)];
+    p.simClass = (i < crit) ? 2 : (i < crit + warn) ? 1 : 0;
+    p.simNext = millis() + random((long)ms);
+  }
+
+  simMs = ms;
+  simTx = tx;
+  simOn = true;
+
+  Serial.println("[SIM] Mulai: " + String(n) + " pasien, tiap " + String(ms) +
+                 " ms, kritis=" + String(crit) + ", waspada=" + String(warn) +
+                 ", tx=" + String(tx ? "ya" : "tidak"));
+}
+
+
+void simTick() {
+
+  if (!simOn) {
+    return;
+  }
+
+  uint32_t now = millis();
+
+  for (int i = 0; i < patientCount; i++) {
+
+    Patient &p = patients[i];
+
+    if (!p.sim || (int32_t)(now - p.simNext) < 0) {
+      continue;
+    }
+
+    int hr, spo2;
+    float temp;
+
+    vitraSimValues(p.simClass, hr, spo2, temp);
+
+    p.simNext += simMs;
+
+    if ((int32_t)(now - p.simNext) >= 0) {
+      p.simNext = now + simMs;     // ketinggalan jauh: sinkron ulang
+    }
+
+    simPackets++;
+    packetCount++;
+
+    applyVitals(i, hr, spo2, temp, -60, -1, simTx);
+  }
+}
+
+
+void handleApiSim() {
+
+  if (server.hasArg("stop")) {
+
+    simStop();
+
+  } else {
+
+    int n    = server.hasArg("n")    ? server.arg("n").toInt()    : 20;
+    int ms   = server.hasArg("ms")   ? server.arg("ms").toInt()   : 1000;
+    int crit = server.hasArg("crit") ? server.arg("crit").toInt() : 0;
+    int warn = server.hasArg("warn") ? server.arg("warn").toInt() : 0;
+    int tx   = server.hasArg("tx")   ? server.arg("tx").toInt()   : 0;
+
+    simStart(n, (uint32_t)(ms < 0 ? 0 : ms), crit, warn, tx != 0);
+  }
+
+  char buf[64];
+  snprintf(buf, sizeof(buf), "{\"ok\":true,\"sim\":%d}", simCount());
+  server.send(200, "application/json", buf);
+}
+
+
+void handleApiStats() {
+
+  char buf[1300];
+
+  uint32_t avg[4];
+
+  for (int i = 0; i < 4; i++) {
+    avg[i] = vitraTx.sent[i] ? vitraTx.waitSum[i] / vitraTx.sent[i] : 0;
+  }
+
+  snprintf(buf, sizeof(buf),
+    "{\"uptime\":%lu,\"heap\":%lu,\"heapMin\":%lu,\"clients\":%d,\"patients\":%d,\"sim\":%d,"
+    "\"simPackets\":%lu,"
+    "\"rf\":{\"sense\":%lu,\"reg\":%lu,\"emack\":%lu,\"other\":%lu,\"lost\":%lu,\"seqRx\":%lu},"
+    "\"api\":{\"calls\":%lu,\"usAvg\":%lu,\"usMax\":%lu,\"bytes\":%lu},"
+    "\"proc\":{\"usAvg\":%lu},\"loopGapMaxUs\":%lu,"
+    "\"tx\":{\"queue\":%d,\"dropped\":%lu,\"airMs\":%lu,"
+    "\"sent\":[%lu,%lu,%lu,%lu],\"deferred\":[%lu,%lu,%lu,%lu],\"forced\":[%lu,%lu,%lu,%lu],"
+    "\"waitAvg\":[%lu,%lu,%lu,%lu],\"waitMax\":[%lu,%lu,%lu,%lu]}}",
+    (unsigned long)((millis() - bootMs) / 1000),
+    (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
+    (int)WiFi.softAPgetStationNum(), patientCount, simCount(),
+    (unsigned long)simPackets,
+    (unsigned long)rfSense, (unsigned long)rfReg, (unsigned long)rfEmack, (unsigned long)rfOther,
+    (unsigned long)rfLost, (unsigned long)rfSeqRx,
+    (unsigned long)apiCalls, (unsigned long)apiUsAvg, (unsigned long)apiUsMax, (unsigned long)apiBytesLast,
+    (unsigned long)rfProcUsAvg, (unsigned long)loopGapMaxUs,
+    txCount, (unsigned long)txDropped, (unsigned long)vitraTx.airMs,
+    (unsigned long)vitraTx.sent[0], (unsigned long)vitraTx.sent[1], (unsigned long)vitraTx.sent[2], (unsigned long)vitraTx.sent[3],
+    (unsigned long)vitraTx.deferred[0], (unsigned long)vitraTx.deferred[1], (unsigned long)vitraTx.deferred[2], (unsigned long)vitraTx.deferred[3],
+    (unsigned long)vitraTx.forced[0], (unsigned long)vitraTx.forced[1], (unsigned long)vitraTx.forced[2], (unsigned long)vitraTx.forced[3],
+    (unsigned long)avg[0], (unsigned long)avg[1], (unsigned long)avg[2], (unsigned long)avg[3],
+    (unsigned long)vitraTx.waitMax[0], (unsigned long)vitraTx.waitMax[1], (unsigned long)vitraTx.waitMax[2], (unsigned long)vitraTx.waitMax[3]);
+
+  loopGapMaxUs = 0;   // jendela pengukuran baru
+
+  server.send(200, "application/json", buf);
+}
+
+
+// =====================================================
+// REGISTRASI PASIEN DARI LOG
+// Format: REG|VITRA-001|AGE=Dewasa|GENDER=Pria|STATUS=Sadar|TRIAGE=Hijau
+// =====================================================
 
 void handleRegistration(const String &packet, int rssi) {
 
@@ -664,14 +1164,14 @@ void handleRegistration(const String &packet, int rssi) {
 
   if (!valid) {
     Serial.println("[LINK] Registrasi tidak valid");
-    sendLoRa("NACK|" + id + "|INVALID");
+    txEnqueue("NACK|" + id + "|INVALID", PRIO_REG);
     Serial.println("================================");
     return;
   }
 
   if (!upsertPatient(id, age, gender, status, triage)) {
     Serial.println("[LINK] Penyimpanan penuh");
-    sendLoRa("NACK|" + id + "|FULL");
+    txEnqueue("NACK|" + id + "|FULL", PRIO_REG);
     Serial.println("================================");
     return;
   }
@@ -681,13 +1181,34 @@ void handleRegistration(const String &packet, int rssi) {
     gender + ", " + status + ", " + triage
   );
 
-  sendLoRa("ACK|" + id);
+  txEnqueue("ACK|" + id, PRIO_REG);
 
-  Serial.println("[LINK] ACK dikirim ke LOG");
+  Serial.println("[LINK] ACK dijadwalkan ke LOG");
+
+  // Data pasien baru/berubah -> SENSE mengulang pengukuran dari awal
+  if (regChanged) {
+
+    int pi = findPatient(id);
+
+    if (pi >= 0) {
+      patients[pi].done = false;
+    }
+
+    if (!txHas("RESTART|" + id)) {
+      txEnqueue("RESTART|" + id, PRIO_REG);
+    }
+
+    Serial.println("[LINK] Data pasien berubah -> RESTART dijadwalkan ke SENSE");
+  }
   Serial.println("================================");
 }
 
-// Dari Sense
+
+// =====================================================
+// DATA VITAL DARI SENSE
+// Format: SENSE|VITRA-001|HR=80|SPO2=98|TEMP=36.8|Q=17
+// =====================================================
+
 void handleSenseData(const String &packet, int rssi) {
 
   int a = packet.indexOf('|');
@@ -695,7 +1216,7 @@ void handleSenseData(const String &packet, int rssi) {
 
   String id = (b > a) ? packet.substring(a + 1, b) : "";
 
-  if (id.length() == 0) {
+  if (id.length() == 0 || id.length() > 20 || sanitizeField(id, 20) != id) {
     return;
   }
 
@@ -706,79 +1227,73 @@ void handleSenseData(const String &packet, int rssi) {
     return;
   }
 
-  Patient &p = patients[idx];
+  String q = getField(packet, "Q");
 
-  p.hasVitals = true;
-  p.hr = getField(packet, "HR").toInt();
-  p.spo2 = getField(packet, "SPO2").toInt();
-  p.temp = getField(packet, "TEMP").toFloat();
-  p.lastVitalsMs = millis();
-  p.rssi = rssi;
+  applyVitals(idx,
+              getField(packet, "HR").toInt(),
+              getField(packet, "SPO2").toInt(),
+              getField(packet, "TEMP").length() ? getField(packet, "TEMP").toFloat() : 36.6f,  // Sense asli tanpa sensor suhu -> netral
+              rssi,
+              q.length() ? (int)q.toInt() : -1,
+              true);
 
-  VitalLevel v = classifyVitals(p.hr, p.spo2, p.temp);
+  // Pengiriman terjadwal terakhir sesi bertanda LAST=1 -> sesi selesai
+  patients[idx].done = (getField(packet, "LAST") == "1");
 
-  Serial.println();
-  Serial.println("================================");
-  Serial.println("[LINK] DATA VITAL DITERIMA");
-  Serial.println("================================");
-  Serial.println("ID   : " + id + (p.reg ? " (terdaftar)" : " (belum terdaftar)"));
-  Serial.println("HR   : " + String(p.hr) + " bpm");
-  Serial.println("SpO2 : " + String(p.spo2) + " %");
-  Serial.println("Suhu : " + String(p.temp, 1) + " C");
-  Serial.println("RSSI : " + String(rssi) + " dBm");
-
-  if (v.lv > 0) {
-    Serial.println("STATUS: " + v.why);
+  // Pembacaan waspada/kritis (A=1) minta konfirmasi; Sense mengulang sampai WACK diterima
+  if (getField(packet, "A") == "1" && !txHas("WACK|" + id)) {
+    txEnqueue("WACK|" + id, PRIO_CRIT);
   }
-
-  Serial.println("================================");
-
-  updateEmergencyState(idx, v.lv);
 }
 
-void receiveLoRa() {
 
-  int packetSize = LoRa.parsePacket();
+// =====================================================
+// PAKET LoRa MASUK (dipanggil oleh vitraPoll)
+// =====================================================
 
-  if (packetSize <= 0) {
-    return;
-  }
+void onLoRaPacket(const String &received, int rssi) {
 
-  String received = "";
-
-  while (LoRa.available()) {
-    received += (char)LoRa.read();
-  }
-
-  received.trim();
-
-  if (received.length() == 0) {
-    return;
-  }
-
-  int rssi = LoRa.packetRssi();
-
-  if (received.startsWith("REG|")) {
-    handleRegistration(received, rssi);
-    return;
-  }
-
-  if (received.startsWith("EMACK|")) {
-    handleEmergencyAck(received);
-    return;
-  }
+  uint32_t t0 = micros();
 
   if (received.startsWith("SENSE|")) {
+
+    rfSense++;
     packetCount++;
     handleSenseData(received, rssi);
-    return;
+
+  } else if (received.startsWith("REG|")) {
+
+    rfReg++;
+    handleRegistration(received, rssi);
+
+  } else if (received.startsWith("EMACK|")) {
+
+    rfEmack++;
+    handleEmergencyAck(received);
+
+  } else {
+
+    rfOther++;
+
+    Serial.println(
+      "[RX] Paket tidak dikenal: " + received +
+      " | RSSI " + String(rssi) + " dBm"
+    );
   }
 
-  Serial.println(
-    "[RX] Paket tidak dikenal: " + received +
-    " | RSSI " + String(rssi) + " dBm"
-  );
+  rfProcUsAvg = (rfProcUsAvg * 7 + (micros() - t0)) / 8;
 }
+
+
+// Dipanggil dari dalam vitraSend() selagi menunggu giliran, supaya web tetap responsif
+void linkIdle() {
+  server.handleClient();
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
 
 void setup() {
 
@@ -821,12 +1336,12 @@ void setup() {
     }
   }
 
-  LoRa.setSpreadingFactor(9);
-  LoRa.setSignalBandwidth(125E3);
-  LoRa.setCodingRate4(5);
-  LoRa.enableCrc();
+  vitraRadioConfig();
 
-  Serial.println("[LoRa] OK");
+  vitraRxHandler = onLoRaPacket;
+  vitraIdleHook = linkIdle;
+
+  Serial.println("[LoRa] OK (SF" + String(LORA_SF) + ")");
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
@@ -837,19 +1352,43 @@ void setup() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/data", HTTP_GET, handleApiData);
 
+#if LINK_TEST_TOOLS
+  server.on("/stats", HTTP_GET, handleStatsPage);
+  server.on("/api/stats", HTTP_GET, handleApiStats);
+  server.on("/api/sim", HTTP_GET, handleApiSim);
+#endif
+
   server.begin();
 
   Serial.println();
   Serial.println("================================");
   Serial.println("VITRA-LINK SIAP");
-  Serial.println("Buka:");
-  Serial.println("http://" + WiFi.softAPIP().toString());
+  Serial.println("Dashboard : http://" + WiFi.softAPIP().toString());
+#if LINK_TEST_TOOLS
+  Serial.println("Uji beban : http://" + WiFi.softAPIP().toString() + "/stats");
+#endif
   Serial.println("================================");
 }
 
-void loop() {
-  server.handleClient();
-  receiveLoRa();
 
-  delay(5);
+void loop() {
+
+  static uint32_t lastLoopUs = 0;
+
+  uint32_t nowUs = micros();
+
+  if (lastLoopUs != 0) {
+    uint32_t gap = nowUs - lastLoopUs;
+    if (gap > loopGapMaxUs) loopGapMaxUs = gap;
+  }
+
+  lastLoopUs = nowUs;
+
+  vitraPoll();      // baca paket RF yang sudah masuk
+  emergencyTick();  // ulangi EMERG yang belum di-EMACK
+  txPump();         // kirim item antrian berprioritas tertinggi
+  simTick();        // pasien simulasi (kalau aktif)
+  server.handleClient();
+
+  delay(1);
 }
