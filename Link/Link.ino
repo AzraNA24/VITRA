@@ -1,3 +1,13 @@
+/*
+ * ============================================================================
+ * Nama Ciptaan    : Sistem Penyiraman Tanaman Otomatis Berbasis IoT (SmartFarm)
+ * Nama File       : VitraLink.ino
+ * Pencipta        : Azra Nabila Azzahra
+ * Mikrokontroler  : ESP32 DevKit V1
+ * Deskripsi       : Program utama VITRA Link.
+ * ============================================================================
+ */
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -54,7 +64,6 @@ struct Patient {
   bool hasVitals = false;
   int hr = 0;
   int spo2 = 0;
-  float temp = 0;
   unsigned long lastVitalsMs = 0;
   int rssi = 0;
   int lastLevel = 0;
@@ -372,7 +381,7 @@ void updateEmergencyState(int idx, int lv) {
 
     if (needSend) {
 
-      VitalLevel v = vitraClassify(p.hr, p.spo2, p.temp);
+      VitalLevel v = vitraClassify(p.hr, p.spo2);
 
       char why[48];
       vitraWhy(v, why, sizeof(why));
@@ -382,8 +391,8 @@ void updateEmergencyState(int idx, int lv) {
       }
 
       char pkt[120];
-      snprintf(pkt, sizeof(pkt), "EMERG|%s|HR=%d|SPO2=%d|TEMP=%.1f|WHY=%s",
-               p.id.c_str(), p.hr, p.spo2, (double)p.temp, why);
+      snprintf(pkt, sizeof(pkt), "EMERG|%s|HR=%d|SPO2=%d|WHY=%s",
+               p.id.c_str(), p.hr, p.spo2, why);
 
       // Jangan menumpuk EMERG yang sama di antrian
       if (!txHas("EMERG|" + p.id + "|")) {
@@ -432,7 +441,7 @@ void emergencyTick() {
       continue;
     }
 
-    updateEmergencyState(i, vitraClassify(p.hr, p.spo2, p.temp).lv);
+    updateEmergencyState(i, vitraClassify(p.hr, p.spo2).lv);
   }
 }
 
@@ -441,7 +450,7 @@ void emergencyTick() {
 // TERAPKAN DATA VITAL (dipakai paket RF maupun simulator)
 // =====================================================
 
-void applyVitals(int idx, int hr, int spo2, float temp, int rssi, int seq, bool allowTx) {
+void applyVitals(int idx, int hr, int spo2, int rssi, int seq, bool allowTx) {
 
   Patient &p = patients[idx];
 
@@ -464,11 +473,10 @@ void applyVitals(int idx, int hr, int spo2, float temp, int rssi, int seq, bool 
   p.hasVitals = true;
   p.hr = hr;
   p.spo2 = spo2;
-  p.temp = temp;
   p.lastVitalsMs = millis();
   p.rssi = rssi;
 
-  VitalLevel v = vitraClassify(hr, spo2, temp);
+  VitalLevel v = vitraClassify(hr, spo2);
 
   if (v.lv != p.lastLevel) {
     Serial.printf("[LINK] %s level %d -> %d\n", p.id.c_str(), p.lastLevel, v.lv);
@@ -477,8 +485,8 @@ void applyVitals(int idx, int hr, int spo2, float temp, int rssi, int seq, bool 
 
 #if LINK_VERBOSE
   if (!p.sim) {
-    Serial.printf("[SENSE] %-10s HR=%3d SpO2=%3d T=%4.1f L%d %4ddBm q=%d %s\n",
-                  p.id.c_str(), hr, spo2, (double)temp, v.lv, rssi, seq,
+    Serial.printf("[SENSE] %-10s HR=%3d SpO2=%3d L%d %4ddBm q=%d %s\n",
+                  p.id.c_str(), hr, spo2, v.lv, rssi, seq,
                   p.reg ? "" : "(belum terdaftar)");
   }
 #endif
@@ -495,66 +503,69 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#3B1646">
 <title>VITRA LINK</title>
 <style>
-:root{--bg:#0a121e;--card:#192332;--card2:#101a29;--line:#26344a;--text:#f5f5f5;--muted:#8a96ab;--ok:#32d282;--warn:#ffbe1e;--crit:#f04646;--pri:#1e8cf0}
+:root{--cream:#FBF5EE;--tint:#F6E3E6;--line:#E3CBD0;--text:#24101F;--plum:#3B1646;--muted:#6B5566;--ok:#2E7D4F;--warn:#E8A317;--warnd:#8A5200;--crit:#B71C3C;--pri:#3B1646;--pink:#F4A3B5;--soft:#F1E4EE}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}
+body{margin:0;min-height:100vh;background-color:#3B1646;background-image:linear-gradient(135deg,#B71C3C 0%,#3B1646 65%);background-attachment:fixed;color:var(--text);font:15px/1.4 Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}
 .wrap{max-width:1100px;margin:0 auto;padding:16px}
-header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
-h1{margin:0;font-size:22px;letter-spacing:.5px}
-h1 span{color:var(--pri)}
-.meta{color:var(--muted);font-size:13px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--ok);margin-right:6px}
-.dot.bad{background:var(--crit)}
-#banner{display:none;background:var(--crit);color:#fff;border-radius:10px;padding:12px 16px;margin-bottom:14px;font-weight:700;animation:blink 1s infinite}
-#banner small{display:block;font-weight:400;opacity:.9}
-@keyframes blink{50%{opacity:.7}}
+header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px;color:var(--cream)}
+h1{margin:0;font-size:24px;letter-spacing:.5px;font-weight:800;display:flex;align-items:center;gap:10px}
+h1 svg{flex:none}
+h1 span{color:var(--pink)}
+.meta{color:var(--soft);font-size:13px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#7CE0A5;margin-right:6px}
+.dot.bad{background:var(--pink);box-shadow:0 0 0 2px var(--cream)}
+#banner{display:none;background:var(--cream);color:var(--crit);border:2px solid var(--crit);border-left-width:10px;border-radius:12px;padding:12px 16px;margin-bottom:14px;font-weight:800;animation:blink 1s infinite}
+#banner small{display:block;font-weight:500;color:var(--text)}
+@keyframes blink{50%{opacity:.75}}
 @media (prefers-reduced-motion:reduce){#banner{animation:none}}
 .sum{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;margin-bottom:14px}
-.chip{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px}
-.chip b{display:block;font-size:26px}
+.chip{background:var(--cream);border:1px solid var(--line);border-radius:12px;padding:10px 14px}
+.chip b{display:block;font-size:26px;color:var(--plum)}
 .chip span{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
 .chip.c b{color:var(--crit)}
-.chip.w b{color:var(--warn)}
+.chip.w b{color:var(--warnd)}
 .chip.o b{color:var(--ok)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:14px}
-.card{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--ok);border-radius:12px;padding:14px}
+.card{background:var(--cream);border:1px solid var(--line);border-left:6px solid var(--ok);border-radius:14px;padding:14px}
 .card.warn{border-left-color:var(--warn)}
-.card.crit{border-color:var(--crit);border-left-color:var(--crit);box-shadow:0 0 0 1px var(--crit) inset}
-.card.off,.card.wait{border-left-color:var(--muted);opacity:.75}
-.card.done{border-left-color:var(--pri);opacity:.85}
+.card.crit{border-color:var(--crit);border-left-color:var(--crit);box-shadow:0 0 0 2px var(--crit) inset}
+.card.off,.card.wait{border-left-color:#8A7A86;opacity:.88}
+.card.done{border-left-color:var(--pri);opacity:.92}
 .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
-.pid{font-weight:700;font-size:18px}
-.pill{font-size:11px;font-weight:700;padding:3px 9px;border-radius:99px;background:var(--ok);color:#06210f}
-.pill.warn{background:var(--warn);color:#2b1d00}
+.pid{font-weight:700;font-size:18px;color:var(--plum)}
+.pill{font-size:11px;font-weight:700;padding:3px 9px;border-radius:99px;background:var(--ok);color:#fff}
+.pill.warn{background:var(--warn);color:#2B1D00}
 .pill.crit{background:var(--crit);color:#fff}
-.pill.off,.pill.wait{background:var(--muted);color:#0a121e}
+.pill.off,.pill.wait{background:#6F5E6B;color:#fff}
 .pill.done{background:var(--pri);color:#fff}
 .info{color:var(--muted);font-size:13px;margin-bottom:10px}
 .tri{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;font-weight:600;margin-left:6px;color:#111}
-.tri.Hijau{background:var(--ok)}
-.tri.Kuning{background:var(--warn)}
-.vitals{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
-.v{background:var(--card2);border-radius:8px;padding:8px 6px;text-align:center;border-bottom:3px solid var(--ok)}
+.tri.Hijau{background:#8FD6A9}
+.tri.Kuning{background:#F6D36B}
+.vitals{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.v{background:var(--tint);border-radius:10px;padding:8px 6px;text-align:center;border-bottom:3px solid var(--ok)}
 .v.l1{border-bottom-color:var(--warn)}
 .v.l2{border-bottom-color:var(--crit)}
 .vl{color:var(--muted);font-size:11px;text-transform:uppercase}
-.vv{font-size:26px;font-weight:700}
+.vv{font-size:26px;font-weight:700;color:var(--plum)}
 .vv small{font-size:11px;font-weight:400;color:var(--muted);margin-left:2px}
-.v.l1 .vv{color:var(--warn)}
+.v.l1 .vv{color:var(--warnd)}
 .v.l2 .vv{color:var(--crit)}
 .why{margin-top:10px;font-weight:600;font-size:13px;color:var(--crit)}
-.why.w{color:var(--warn)}
+.why.w{color:var(--warnd)}
 .foot{margin-top:8px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
-.empty{grid-column:1/-1;color:var(--muted);text-align:center;padding:36px 0}
+.empty{grid-column:1/-1;color:var(--soft);text-align:center;padding:36px 0}
+.card .empty{color:var(--muted)}
 </style>
 </head>
 <body>
 <div class="wrap">
 
 <header>
-  <h1>VITRA <span>LINK</span></h1>
+  <h1><svg width="38" height="38" viewBox="0 0 260 260" aria-hidden="true"><circle cx="130" cy="130" r="120" fill="none" stroke="#FBF5EE" stroke-width="10" stroke-dasharray="7 11" stroke-linecap="round"/><circle cx="130" cy="130" r="96" fill="#3B1646"/><polyline points="50,130 88,130 100,96 114,166 128,112 136,130 168,130 176,116 184,142 190,130 210,130" fill="none" stroke="#FBF5EE" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/></svg>VITRA <span>LINK</span></h1>
   <div class="meta">
     <span><i class="dot" id="dot"></i><span id="conn">Menghubungkan&hellip;</span></span>
     <span>Paket SENSE: <b id="pk">0</b></span>
@@ -626,7 +637,6 @@ function card(p){
     body = '<div class="vitals">' +
       tile('HR',   p.hr   > 0 ? p.hr : '--',                 'bpm', p.lh) +
       tile('SpO2', p.spo2 > 0 ? p.spo2 : '--',               '%',   p.ls) +
-      tile('Suhu', p.temp > 0 ? p.temp.toFixed(1) : '--',    '&deg;C', p.lt) +
       '</div>';
   } else {
     body = '<div class="empty" style="padding:16px 0">Menunggu data VITRA SENSE&hellip;</div>';
@@ -727,21 +737,21 @@ const char STATS_HTML[] PROGMEM = R"rawliteral(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VITRA LINK - Stats</title>
 <style>
-body{margin:0 auto;background:#0a121e;color:#f5f5f5;font:14px/1.4 system-ui,sans-serif;padding:16px;max-width:1000px}
+body{margin:0 auto;background:#3B1646;color:#FBF5EE;font:14px/1.4 Inter,system-ui,sans-serif;padding:16px;max-width:1000px}
 h1{font-size:20px;margin:0 0 12px}
-h2{font-size:12px;color:#8a96ab;text-transform:uppercase;letter-spacing:.5px;margin:18px 0 6px}
+h2{font-size:12px;color:#F4A3B5;text-transform:uppercase;letter-spacing:.5px;margin:18px 0 6px}
 .g{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
-.c{background:#192332;border:1px solid #26344a;border-radius:8px;padding:8px 12px}
-.c b{display:block;font-size:20px}
-.c span{color:#8a96ab;font-size:11px;text-transform:uppercase}
+.c{background:#FBF5EE;border:1px solid #E3CBD0;border-radius:10px;padding:8px 12px}
+.c b{display:block;font-size:20px;color:#3B1646}
+.c span{color:#6B5566;font-size:11px;text-transform:uppercase}
 table{width:100%;border-collapse:collapse}
-td,th{padding:4px 8px;border-bottom:1px solid #26344a;text-align:right}
+td,th{padding:4px 8px;border-bottom:1px solid #7A5A86;text-align:right}
 th:first-child,td:first-child{text-align:left}
-label{margin-right:12px;color:#8a96ab}
-input{width:70px;background:#101a29;color:#fff;border:1px solid #26344a;border-radius:6px;padding:4px}
-button{background:#1e8cf0;color:#fff;border:0;border-radius:6px;padding:6px 14px;cursor:pointer;margin-right:6px}
-button.s{background:#f04646}
-a{color:#1e8cf0;font-size:13px}
+label{margin-right:12px;color:#F1E4EE}
+input{width:70px;background:#FBF5EE;color:#24101F;border:1px solid #E3CBD0;border-radius:6px;padding:4px}
+button{background:#B71C3C;color:#fff;border:0;border-radius:6px;padding:6px 14px;cursor:pointer;margin-right:6px}
+button.s{background:#FBF5EE;color:#3B1646}
+a{color:#F4A3B5;font-size:13px}
 </style></head><body>
 <h1>VITRA LINK &middot; Stats &amp; Uji Beban <a href="/">&larr; dashboard</a></h1>
 
@@ -901,10 +911,10 @@ void handleApiData() {
 
     Patient &p = patients[i];
 
-    VitalLevel v = vitraClassify(p.hr, p.spo2, p.temp);
+    VitalLevel v = vitraClassify(p.hr, p.spo2);
 
     if (!p.hasVitals) {
-      v.lh = v.ls = v.lt = v.lv = 0;
+      v.lh = v.ls = v.lv = 0;
     }
 
     char why[48];
@@ -914,13 +924,13 @@ void handleApiData() {
 
     n = snprintf(buf, sizeof(buf),
       "%s{\"id\":\"%s\",\"reg\":%s,\"age\":\"%s\",\"gender\":\"%s\",\"status\":\"%s\",\"triage\":\"%s\","
-      "\"hasv\":%s,\"hr\":%d,\"spo2\":%d,\"temp\":%.1f,\"lh\":%d,\"ls\":%d,\"lt\":%d,\"lv\":%d,"
+      "\"hasv\":%s,\"hr\":%d,\"spo2\":%d,\"lh\":%d,\"ls\":%d,\"lv\":%d,"
       "\"why\":\"%s\",\"ago\":%ld,\"rssi\":%d,\"alert\":%d,\"done\":%s}",
       i > 0 ? "," : "",
       p.id.c_str(), p.reg ? "true" : "false",
       p.age.c_str(), p.gender.c_str(), p.status.c_str(), p.triage.c_str(),
-      p.hasVitals ? "true" : "false", p.hr, p.spo2, (double)p.temp,
-      v.lh, v.ls, v.lt, v.lv, why, ago, p.rssi, p.alert, p.done ? "true" : "false");
+      p.hasVitals ? "true" : "false", p.hr, p.spo2,
+      v.lh, v.ls, v.lv, why, ago, p.rssi, p.alert, p.done ? "true" : "false");
 
     if (n > 0 && n < (int)sizeof(buf)) {
       outAdd(buf, n);
@@ -1047,9 +1057,8 @@ void simTick() {
     }
 
     int hr, spo2;
-    float temp;
 
-    vitraSimValues(p.simClass, hr, spo2, temp);
+    vitraSimValues(p.simClass, hr, spo2);
 
     p.simNext += simMs;
 
@@ -1060,7 +1069,7 @@ void simTick() {
     simPackets++;
     packetCount++;
 
-    applyVitals(i, hr, spo2, temp, -60, -1, simTx);
+    applyVitals(i, hr, spo2, -60, -1, simTx);
   }
 }
 
@@ -1206,7 +1215,7 @@ void handleRegistration(const String &packet, int rssi) {
 
 // =====================================================
 // DATA VITAL DARI SENSE
-// Format: SENSE|VITRA-001|HR=80|SPO2=98|TEMP=36.8|Q=17
+// Format: SENSE|VITRA-001|HR=80|SPO2=98|Q=17
 // =====================================================
 
 void handleSenseData(const String &packet, int rssi) {
@@ -1232,7 +1241,6 @@ void handleSenseData(const String &packet, int rssi) {
   applyVitals(idx,
               getField(packet, "HR").toInt(),
               getField(packet, "SPO2").toInt(),
-              getField(packet, "TEMP").length() ? getField(packet, "TEMP").toFloat() : 36.6f,  // Sense asli tanpa sensor suhu -> netral
               rssi,
               q.length() ? (int)q.toInt() : -1,
               true);
@@ -1248,7 +1256,7 @@ void handleSenseData(const String &packet, int rssi) {
 
 
 // =====================================================
-// PAKET LoRa MASUK (dipanggil oleh vitraPoll)
+// PAKET LoRa MASUK 
 // =====================================================
 
 void onLoRaPacket(const String &received, int rssi) {

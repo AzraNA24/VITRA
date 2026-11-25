@@ -1,13 +1,10 @@
+// Noetes
+// Press '?' in serial monitor. d for dummy data, l for SPI loopback test, e/w/n for critical/warning/normal, x for real sensor, f for fall simulation, r to restart session, s for status
 #pragma once
 #include <Arduino.h>
 #include <string.h>
 #include <stdio.h>
 
-// ---------------------------------------------------------------------
-// PIN ESP32-C3 SuperMini <-> SX1278
-// Pin terpakai di main.cpp: 1, 3, 4, 5, 10 (GPIO) dan 20/21 (I2C).
-// DIO0 tidak dipakai (penerimaan memakai polling register).
-// ---------------------------------------------------------------------
 #define LORA_PIN_SCK   8
 #define LORA_PIN_MOSI  9
 #define LORA_PIN_MISO  0
@@ -21,20 +18,17 @@
 #include "vitra_radio.h"
 
 
-// ---------------------------------------------------------------------
-// PARAMETER
-// ---------------------------------------------------------------------
 // DATA DUMMY: 1 = Sense langsung membuat data HR/SpO2/RR normal acak tanpa sensor dan
 // sesi langsung berjalan saat boot (berguna tanpa jari di MAX30102). Bisa juga
 // dinyalakan lewat Serial dengan perintah 'd', dimatikan dengan 'x'.
 #ifndef SENSE_DUMMY_DEFAULT
 #define SENSE_DUMMY_DEFAULT      0
 #endif
-#define SENSE_LORA_TERMINAL      1          // 1 = perintah uji lewat Serial Monitor
-#define SENSE_ACK_WAIT_MS        4000UL     // tunggu WACK setelah paket terkirim
+#define SENSE_LORA_TERMINAL      1          
+#define SENSE_ACK_WAIT_MS        4000UL   
 #define SENSE_ACK_MAX_TRIES      5
-#define SENSE_URGENT_CONFIRM_MS  3000UL     // perubahan level harus bertahan selama ini
-#define SENSE_URGENT_MIN_GAP_MS  8000UL     // jarak minimum kirim-segera non-kritis
+#define SENSE_URGENT_CONFIRM_MS  3000UL     
+#define SENSE_URGENT_MIN_GAP_MS  8000UL     
 #define SENSE_RADIO_RETRY_MS     10000UL    // coba init ulang LoRa bila gagal
 #define SENSE_TEMP_NEUTRAL       36.6f      // Sense tidak punya sensor suhu
 
@@ -124,9 +118,6 @@ static uint8_t slLevel(const SenseSnapshot &s) {
   }
 
   uint8_t l = s.triLevel;
-
-  // Ambang bersama dengan Link (HR, SpO2). Sense asli tidak punya sensor suhu,
-  // jadi dipakai suhu netral agar suhu tidak ikut menaikkan level.
   int v = vitraClassify(s.hr, s.spo2, SENSE_TEMP_NEUTRAL).lv;
 
   if (v > (int)l) {
@@ -150,7 +141,7 @@ static bool slEnqueue(const char *msg, uint8_t prio, bool wantAck) {
 
   for (int i = 0; i < SENSE_TXQ; i++) {
     if (slQ[i].used && strcmp(slQ[i].msg, msg) == 0) {
-      return true;                       // pesan identik sudah mengantri
+      return true;                       
     }
   }
 
