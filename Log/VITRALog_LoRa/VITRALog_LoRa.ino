@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <WiFi.h>
 #include <SPI.h>
 #include <LoRa.h>
 #include <Adafruit_GFX.h>
@@ -25,6 +26,7 @@
 #define BTN_RIGHT  21
 #define BTN_SELECT 22
 #define BTN_LOG    12
+#define BTN_HOME   35
 
 // UART dari modul ESP32-CAM (QR reader)
 #define QR_RX   16
@@ -238,9 +240,6 @@ void handleQR() {
   if (!validSenseId(line)) {
 
     Serial.println("[QR] Tidak dikenali: " + line);
-
-    showScan("QR bukan VITRA Sense");
-
     return;
   }
 
@@ -442,7 +441,44 @@ bool pressed(int pin) {
   return false;
 }
 
+bool homePressed() {
+
+  static unsigned long lowSince = 0;
+  static bool triggered = false;
+
+  if (digitalRead(BTN_HOME) == HIGH) {
+    lowSince = 0;
+    triggered = false;
+    return false;
+  }
+
+  if (lowSince == 0) {
+    lowSince = millis();
+  }
+
+  if (!triggered && millis() - lowSince >= 500) {
+    triggered = true;
+    return true;
+  }
+
+  return false;
+}
+
 void handleButtons() {
+    // Tombol HOME
+    if (homePressed()) {
+
+      if (mode != M_SEND && mode != M_EMERGENCY) {
+
+        senseId = "";
+        qrBuf = "";
+        serBuf = "";
+
+        goHome();
+      }
+
+      return;
+  }
 
   // Layar darurat bisa ditutup dari mode APAPUN dengan tombol SELECT
   if (mode == M_EMERGENCY) {
@@ -474,11 +510,6 @@ void handleButtons() {
     }
 
   } else if (mode == M_LOG) {
-
-    if (pressed(BTN_LOG) || pressed(BTN_SELECT)) {
-      goHome();
-      return;
-    }
 
     // Halaman berikutnya
     if (pressed(BTN_RIGHT)) {
@@ -545,13 +576,15 @@ void handleButtons() {
     // dibiarkan; auto-kembali ke HOME lewat timer di loop()
 
   } else if (mode == M_SCAN) {
-    // Tombol SCAN untuk kembali ke HOME
-    if (pressed(BTN_SCAN)) {
-      senseId = "";
+    // Tombol SELECT untuk simulasi QR
+    if (pressed(BTN_SELECT)) {
+      senseId = "VITRA-002";
       qrBuf = "";
       serBuf = "";
 
-      goHome();
+      Serial.println("[TEST] ID simulasi: " + senseId);
+
+      startForm();
       return;
     }
 
@@ -580,6 +613,10 @@ void setup() {
 
   Serial.begin(115200);
 
+  WiFi.mode(WIFI_OFF);
+  btStop();
+
+  setCpuFrequencyMhz(80);
   delay(1000);
 
   Serial.println();
@@ -598,6 +635,7 @@ void setup() {
   pinMode(BTN_RIGHT,  INPUT_PULLUP);
   pinMode(BTN_SELECT, INPUT_PULLUP);
   pinMode(BTN_LOG,    INPUT_PULLUP);
+  pinMode(BTN_HOME,   INPUT);
 
   Serial2.begin(QR_BAUD, SERIAL_8N1, QR_RX, QR_TX);
 

@@ -1,3 +1,4 @@
+#include <WiFi.h>
 #include "esp_camera.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
@@ -134,10 +135,13 @@ void setup() {
   // put your setup code here, to run once:
 
   // Disable brownout detector.
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  // WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
   /* ---------------------------------------- Init serial communication speed (baud rate). */
   Serial.begin(115200);
+  WiFi.mode(WIFI_OFF);
+  btStop(); 
+  setCpuFrequencyMhz(160);
   // Matikan debug verbose bawaan ESP-IDF supaya jalur UART0 ke VITRA LOG
   // hanya berisi hasil scan QR, bukan campur log sistem.
   Serial.setDebugOutput(false);
@@ -146,7 +150,7 @@ void setup() {
 
   /* ---------------------------------------- Camera configuration. */
   Serial.println("Start configuring and initializing the camera...");
-  camera_config_t config;
+  camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
   config.pin_d0 = Y2_GPIO_NUM;
@@ -209,45 +213,76 @@ void loop() {
 
 /* ________________________________________________________________________________ The function to be executed by "QRCodeReader_Task" */
 // This function is to instruct the camera to take or capture a QR Code image, then it is processed and translated into text.
-void QRCodeReader( void * pvParameters ){
-  /* ---------------------------------------- */
+
+void QRCodeReader(void *pvParameters) {
+
   Serial.println("QRCodeReader is ready.");
-  /* ---------------------------------------- */
 
-  /* ---------------------------------------- Loop to read QR Code in real time. */
-  while(1){
-      q = quirc_new();
-      if (q == NULL){
-        continue;
-      }
+  // Alokasi memori hanya sekali
+  q = quirc_new();
 
-      fb = esp_camera_fb_get();
-      if (!fb)
-      {
-        continue;
-      }
+  if (q == NULL) {
+    Serial.println("QUIRC allocation failed");
+    vTaskDelete(NULL);
+    return;
+  }
 
-      quirc_resize(q, fb->width, fb->height);
-      image = quirc_begin(q, NULL, NULL);
-      memcpy(image, fb->buf, fb->len);
-      quirc_end(q);
+  // Resolusi QVGA: 320 x 240
+  if (quirc_resize(q, 320, 240) < 0) {
+    Serial.println("QUIRC resize failed");
+    quirc_destroy(q);
+    vTaskDelete(NULL);
+    return;
+  }
 
-      int count = quirc_count(q);
-      if (count > 0) {
-        quirc_extract(q, 0, &code);
-        err = quirc_decode(&code, &data);
+  while (1) {
 
-        if (!err){
-          dumpData(&data);
-        }
-      }
+    fb = esp_camera_fb_get();
+
+    if (!fb) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    if (fb->width != 320 ||
+        fb->height != 240 ||
+        fb->len != 320 * 240) {
 
       esp_camera_fb_return(fb);
       fb = NULL;
-      image = NULL;
-      quirc_destroy(q);
+
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    image = quirc_begin(q, NULL, NULL);
+
+    memcpy(image, fb->buf, fb->len);
+
+    // Kembalikan frame buffer setelah disalin
+    esp_camera_fb_return(fb);
+    fb = NULL;
+
+    quirc_end(q);
+
+    int count = quirc_count(q);
+
+    if (count > 0) {
+
+      quirc_extract(q, 0, &code);
+
+      err = quirc_decode(&code, &data);
+
+      if (!err) {
+        dumpData(&data);
+      }
+    }
+
+    image = NULL;
+
+    // Jeda sebelum scanning berikutnya
+    vTaskDelay(pdMS_TO_TICKS(200));
   }
-  /* ---------------------------------------- */
 }
 /* ________________________________________________________________________________ */
 
