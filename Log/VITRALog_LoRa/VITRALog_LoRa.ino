@@ -36,7 +36,7 @@
 #define REG_TIMEOUT_MS 4000
 #define REG_MAX_TRIES  3
 
-#define LORA_SF 9
+#define LORA_SF 11
 
 #include "vitra_radio.h"
 
@@ -604,6 +604,19 @@ void handleButtons() {
   }
 }
 
+void ujiDaya() {
+  int levels[] = {2, 5, 10, 14, 17, 20};
+  for (int i = 0; i < 6; i++) {
+    LoRa.setTxPower(levels[i], PA_OUTPUT_PA_BOOST_PIN);
+    for (int k = 0; k < 3; k++) {
+      LoRa.beginPacket();
+      LoRa.print("TEST|" + String(levels[i]));
+      LoRa.endPacket();
+      delay(1000);
+    }
+  }
+  LoRa.setTxPower(20, PA_OUTPUT_PA_BOOST_PIN);
+}
 
 // =====================================================
 // SETUP / LOOP
@@ -662,19 +675,14 @@ void setup() {
     Serial.println("[LoRa] GAGAL!");
 
   } else {
-    LoRa.setSpreadingFactor(9);
-
-    LoRa.setSignalBandwidth(125E3);
-
-    LoRa.setCodingRate4(5);
-
-    LoRa.enableCrc();
+    vitraRadioConfig();
 
     loraReady = true;
 
     Serial.println("[LoRa] OK");
   }
 
+  ujiDaya();
   showHome();
 }
 
@@ -697,3 +705,4 @@ void loop() {
 
   delay(2);
 }
+

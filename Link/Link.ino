@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- * Nama Ciptaan    : Sistem Penyiraman Tanaman Otomatis Berbasis IoT (SmartFarm)
+ * Nama Ciptaan    : Sistem Asesment kontinus untuk melakukan retriase
  * Nama File       : VitraLink.ino
  * Pencipta        : Azra Nabila Azzahra
  * Mikrokontroler  : ESP32 DevKit V1
@@ -34,9 +34,10 @@ const char* AP_PASSWORD = "12345678";
 #define LORA_FREQUENCY 433E6
 
 // SF HARUS SAMA di Sense, Link, dan Log
-#define LORA_SF 9
+#define LORA_SF 11
 
 #include "vitra_radio.h"
+struct VitalAll;
 
 
 // -----------------------------------------------------
@@ -64,6 +65,7 @@ struct Patient {
   bool hasVitals = false;
   int hr = 0;
   int spo2 = 0;
+  int rr = 0;                
   unsigned long lastVitalsMs = 0;
   int rssi = 0;
   int lastLevel = 0;
@@ -367,6 +369,85 @@ bool upsertPatient(const String &id, const String &age,
 
 
 // =====================================================
+// KLASIFIKASI RR (laju napas, napas/menit)
+//   12 - 20            -> 0 Stabil
+//   10-11 atau 21-30   -> 1 Waspada
+//   < 10 atau > 30     -> 2 Darurat
+// rr <= 0 = Sense belum/tidak mengirim RR -> tidak ikut dinilai
+// =====================================================
+
+int classifyRR(int rr) {
+
+  if (rr <= 0) {
+    return 0;
+  }
+
+  if (rr < 10 || rr > 30) {
+    return 2;
+  }
+
+  if (rr <= 11 || rr >= 21) {
+    return 1;
+  }
+
+  return 0;
+}
+
+
+// Hasil gabungan HR + SpO2 (dari vitra_radio.h) + RR. lv = level terfburuk dari ketiganya.
+struct VitalAll {
+  VitalLevel v;   // HR + SpO2
+  int lr;         // level RR
+  int lv;         // level gabungan
+};
+
+
+VitalAll classifyAll(int hr, int spo2, int rr) {
+
+  VitalAll a;
+
+  a.v  = vitraClassify(hr, spo2);
+  a.lr = classifyRR(rr);
+  a.lv = (a.v.lv > a.lr) ? a.v.lv : a.lr;
+
+  return a;
+}
+
+
+// Alasan gabungan, dipisah "+" (contoh: "HR tinggi+RR rendah")
+void whyAll(VitalAll a, int rr, char *out, size_t n) {
+
+  vitraWhy(a.v, out, n);
+
+  if (a.v.lv == 0) {
+    out[0] = 0;
+  }
+
+  if (a.lr > 0) {
+
+    size_t len = strlen(out);
+
+    snprintf(out + len, n - len, "%s%s", len ? "+" : "", rr < 12 ? "RR rendah" : "RR tinggi");
+  }
+}
+
+
+// Nilai RR untuk pasien simulasi, sesuai kelasnya
+int simRR(uint8_t cls) {
+
+  if (cls >= 2) {
+    return random(2) ? (int)random(4, 10) : (int)random(31, 40);
+  }
+
+  if (cls == 1) {
+    return random(2) ? (int)random(21, 31) : (int)random(10, 12);
+  }
+
+  return (int)random(12, 21);
+}
+
+
+// =====================================================
 // DARURAT -- kirim & kelola alert ke VITRA LOG
 // =====================================================
 
@@ -381,16 +462,16 @@ void updateEmergencyState(int idx, int lv) {
 
     if (needSend) {
 
-      VitalLevel v = vitraClassify(p.hr, p.spo2);
+      VitalAll v = classifyAll(p.hr, p.spo2, p.rr);
 
-      char why[48];
-      vitraWhy(v, why, sizeof(why));
+      char why[64];
+      whyAll(v, p.rr, why, sizeof(why));
 
       for (char *c = why; *c; c++) {
         if (*c == ' ') *c = '_';
       }
 
-      char pkt[120];
+      char pkt[140];
       snprintf(pkt, sizeof(pkt), "EMERG|%s|HR=%d|SPO2=%d|WHY=%s",
                p.id.c_str(), p.hr, p.spo2, why);
 
@@ -441,7 +522,7 @@ void emergencyTick() {
       continue;
     }
 
-    updateEmergencyState(i, vitraClassify(p.hr, p.spo2).lv);
+    updateEmergencyState(i, classifyAll(p.hr, p.spo2, p.rr).lv);
   }
 }
 
@@ -450,7 +531,7 @@ void emergencyTick() {
 // TERAPKAN DATA VITAL (dipakai paket RF maupun simulator)
 // =====================================================
 
-void applyVitals(int idx, int hr, int spo2, int rssi, int seq, bool allowTx) {
+void applyVitals(int idx, int hr, int spo2, int rr, int rssi, int seq, bool allowTx) {
 
   Patient &p = patients[idx];
 
@@ -473,10 +554,11 @@ void applyVitals(int idx, int hr, int spo2, int rssi, int seq, bool allowTx) {
   p.hasVitals = true;
   p.hr = hr;
   p.spo2 = spo2;
+  p.rr = rr;
   p.lastVitalsMs = millis();
   p.rssi = rssi;
 
-  VitalLevel v = vitraClassify(hr, spo2);
+  VitalAll v = classifyAll(hr, spo2, rr);
 
   if (v.lv != p.lastLevel) {
     Serial.printf("[LINK] %s level %d -> %d\n", p.id.c_str(), p.lastLevel, v.lv);
@@ -485,8 +567,8 @@ void applyVitals(int idx, int hr, int spo2, int rssi, int seq, bool allowTx) {
 
 #if LINK_VERBOSE
   if (!p.sim) {
-    Serial.printf("[SENSE] %-10s HR=%3d SpO2=%3d L%d %4ddBm q=%d %s\n",
-                  p.id.c_str(), hr, spo2, v.lv, rssi, seq,
+    Serial.printf("[SENSE] %-10s HR=%3d SpO2=%3d RR=%2d L%d %4ddBm q=%d %s\n",
+                  p.id.c_str(), hr, spo2, rr, v.lv, rssi, seq,
                   p.reg ? "" : "(belum terdaftar)");
   }
 #endif
@@ -545,13 +627,13 @@ h1 span{color:var(--pink)}
 .tri{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;font-weight:600;margin-left:6px;color:#111}
 .tri.Hijau{background:#8FD6A9}
 .tri.Kuning{background:#F6D36B}
-.vitals{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.vitals{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
 .v{background:var(--tint);border-radius:10px;padding:8px 6px;text-align:center;border-bottom:3px solid var(--ok)}
 .v.l1{border-bottom-color:var(--warn)}
 .v.l2{border-bottom-color:var(--crit)}
 .vl{color:var(--muted);font-size:11px;text-transform:uppercase}
-.vv{font-size:26px;font-weight:700;color:var(--plum)}
-.vv small{font-size:11px;font-weight:400;color:var(--muted);margin-left:2px}
+.vv{font-size:24px;font-weight:700;color:var(--plum)}
+.vv small{display:block;font-size:11px;font-weight:400;color:var(--muted)}
 .v.l1 .vv{color:var(--warnd)}
 .v.l2 .vv{color:var(--crit)}
 .why{margin-top:10px;font-weight:600;font-size:13px;color:var(--crit)}
@@ -637,6 +719,7 @@ function card(p){
     body = '<div class="vitals">' +
       tile('HR',   p.hr   > 0 ? p.hr : '--',                 'bpm', p.lh) +
       tile('SpO2', p.spo2 > 0 ? p.spo2 : '--',               '%',   p.ls) +
+      tile('RR',   p.rr   > 0 ? p.rr   : '--',               'rpm', p.lr || 0) +
       '</div>';
   } else {
     body = '<div class="empty" style="padding:16px 0">Menunggu data VITRA SENSE&hellip;</div>';
@@ -900,7 +983,7 @@ void handleApiData() {
   outLen = 0;
   outTotal = 0;
 
-  char buf[512];
+  char buf[640];
 
   int n = snprintf(buf, sizeof(buf), "{\"packets\":%lu,\"uptime\":%lu,\"off\":%lu,\"patients\":[",
                    (unsigned long)packetCount, (unsigned long)((millis() - bootMs) / 1000),
@@ -911,26 +994,27 @@ void handleApiData() {
 
     Patient &p = patients[i];
 
-    VitalLevel v = vitraClassify(p.hr, p.spo2);
+    VitalAll v = classifyAll(p.hr, p.spo2, p.rr);
 
     if (!p.hasVitals) {
-      v.lh = v.ls = v.lv = 0;
+      v.v.lh = v.v.ls = v.v.lv = 0;
+      v.lr = v.lv = 0;
     }
 
-    char why[48];
-    vitraWhy(v, why, sizeof(why));
+    char why[64];
+    whyAll(v, p.rr, why, sizeof(why));
 
     long ago = p.hasVitals ? (long)((millis() - p.lastVitalsMs) / 1000) : 0;
 
     n = snprintf(buf, sizeof(buf),
       "%s{\"id\":\"%s\",\"reg\":%s,\"age\":\"%s\",\"gender\":\"%s\",\"status\":\"%s\",\"triage\":\"%s\","
-      "\"hasv\":%s,\"hr\":%d,\"spo2\":%d,\"lh\":%d,\"ls\":%d,\"lv\":%d,"
+      "\"hasv\":%s,\"hr\":%d,\"spo2\":%d,\"rr\":%d,\"lh\":%d,\"ls\":%d,\"lr\":%d,\"lv\":%d,"
       "\"why\":\"%s\",\"ago\":%ld,\"rssi\":%d,\"alert\":%d,\"done\":%s}",
       i > 0 ? "," : "",
       p.id.c_str(), p.reg ? "true" : "false",
       p.age.c_str(), p.gender.c_str(), p.status.c_str(), p.triage.c_str(),
-      p.hasVitals ? "true" : "false", p.hr, p.spo2,
-      v.lh, v.ls, v.lv, why, ago, p.rssi, p.alert, p.done ? "true" : "false");
+      p.hasVitals ? "true" : "false", p.hr, p.spo2, p.rr,
+      v.v.lh, v.v.ls, v.lr, v.lv, why, ago, p.rssi, p.alert, p.done ? "true" : "false");
 
     if (n > 0 && n < (int)sizeof(buf)) {
       outAdd(buf, n);
@@ -1060,6 +1144,8 @@ void simTick() {
 
     vitraSimValues(p.simClass, hr, spo2);
 
+    int rr = simRR(p.simClass);
+
     p.simNext += simMs;
 
     if ((int32_t)(now - p.simNext) >= 0) {
@@ -1069,7 +1155,7 @@ void simTick() {
     simPackets++;
     packetCount++;
 
-    applyVitals(i, hr, spo2, -60, -1, simTx);
+    applyVitals(i, hr, spo2, rr, -60, -1, simTx);
   }
 }
 
@@ -1215,7 +1301,7 @@ void handleRegistration(const String &packet, int rssi) {
 
 // =====================================================
 // DATA VITAL DARI SENSE
-// Format: SENSE|VITRA-001|HR=80|SPO2=98|Q=17
+// Format: SENSE|VITRA-001|HR=80|SPO2=98|RR=16|Q=17
 // =====================================================
 
 void handleSenseData(const String &packet, int rssi) {
@@ -1241,6 +1327,7 @@ void handleSenseData(const String &packet, int rssi) {
   applyVitals(idx,
               getField(packet, "HR").toInt(),
               getField(packet, "SPO2").toInt(),
+              getField(packet, "RR").toInt(),
               rssi,
               q.length() ? (int)q.toInt() : -1,
               true);

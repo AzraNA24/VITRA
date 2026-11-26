@@ -1,4 +1,3 @@
-
 #pragma once
 #include <Arduino.h>
 #include <SPI.h>
@@ -9,7 +8,7 @@
 #error "Definisikan LORA_SS sebelum #include \"vitra_radio.h\""
 #endif
 #ifndef LORA_SF
-#define LORA_SF 9
+#define LORA_SF 11
 #endif
 
 // ---------------------------------------------------------------------
@@ -23,8 +22,13 @@
 #define SPO2_CRIT      90
 #define SPO2_WARN      95
 
+#define RR_CRIT_LO     10
+#define RR_CRIT_HI     30
+#define RR_WARN_LO     12
+#define RR_WARN_HI     20
+
 struct VitalLevel {
-  int8_t lh, ls, lv;  // 0 normal, 1 waspada, 2 kritis
+  int8_t lh, ls, lv, lr;  // 0 normal, 1 waspada, 2 kritis (lv = terburuk dari HR/SpO2/RR; lr = RR)
 };
 
 static inline int vitraLevelHr(int hr) {
@@ -39,27 +43,38 @@ static inline int vitraLevelSpo2(int s) {
   return 0;
 }
 
-static inline VitalLevel vitraClassify(int hr, int spo2) {
+static inline int vitraLevelRr(int rr) {
+  if (rr <= 0) return 0;
+  if (rr < RR_CRIT_LO || rr > RR_CRIT_HI) return 2;
+  if (rr < RR_WARN_LO || rr > RR_WARN_HI) return 1;
+  return 0;
+}
+
+static inline VitalLevel vitraClassify(int hr, int spo2, int rr = 0) {
   VitalLevel v;
 
   int lh = vitraLevelHr(hr);
   int ls = vitraLevelSpo2(spo2);
+  int lr = vitraLevelRr(rr);
+
+  int worst = (lh > ls) ? lh : ls;
 
   v.lh = lh;
   v.ls = ls;
-  v.lv = (lh > ls) ? lh : ls;
+  v.lr = lr;
+  v.lv = (worst > lr) ? worst : lr;
 
   return v;
 }
 
 static void vitraWhy(const VitalLevel &v, char *out, size_t n) {
-  const char *names[2] = { "HR", "SpO2" };
-  int lv[2] = { v.lh, v.ls };
+  const char *names[3] = { "HR", "SpO2", "RR" };
+  int lv[3] = { v.lh, v.ls, v.lr };
 
   size_t len = 0;
   out[0] = 0;
 
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < 3; i++) {
     if (lv[i] <= 0) continue;
 
     int w = snprintf(
@@ -88,6 +103,19 @@ static void vitraSimValues(int mode, int &hr, int &spo2) {
   } else {
     hr = random(70, 100);
     spo2 = random(95, 100);
+  }
+}
+
+// Versi dengan RR (pasien simulasi). Versi 3 argumen di atas tetap ada.
+static void vitraSimValues(int mode, int &hr, int &spo2, int &rr) {
+  vitraSimValues(mode, hr, spo2);
+
+  if (mode >= 2) {
+    rr = random(2) ? (int)random(4, 10) : (int)random(31, 40);
+  } else if (mode == 1) {
+    rr = random(2) ? (int)random(21, 31) : (int)random(10, 12);
+  } else {
+    rr = (int)random(12, 21);
   }
 }
 
@@ -163,6 +191,7 @@ static void vitraRadioConfig() {
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
   LoRa.enableCrc();
+  LoRa.setTxPower(20, PA_OUTPUT_PA_BOOST_PIN); 
 }
 
 static uint32_t vitraAirtimeMs(int payloadLen) {
@@ -310,4 +339,12 @@ static bool vitraSend(const String &msg, uint8_t prio) {
   inSend = false;
 
   return ok == 1;
+}
+
+static void vitraPrintNoiseFloor() {
+  LoRa.receive();
+  delay(200);
+  long s = 0;
+  for (int i = 0; i < 50; i++) { s += LoRa.rssi(); delay(10); }
+  Serial.println("[LoRa] Noise floor: " + String(s / 50) + " dBm");
 }
