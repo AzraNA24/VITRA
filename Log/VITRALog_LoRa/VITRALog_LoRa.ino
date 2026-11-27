@@ -111,7 +111,7 @@ String emergId = "";
 String emergWhy = "";
 String emergHr = "";
 String emergSpo2 = "";
-String emergTemp = "";
+String emergRr = "";
 
 
 // Baca satu baris dari stream tanpa blocking
@@ -336,7 +336,7 @@ void checkAckTimeout() {
 
 void handleEmergencyPacket(const String &received) {
 
-  // Format: EMERG|<id>|HR=..|SPO2=..|TEMP=..|WHY=...
+  // Format: EMERG|<id>|HR=..|SPO2=..|RR=..|WHY=...
   int a = received.indexOf('|');
   int b = received.indexOf('|', a + 1);
 
@@ -349,7 +349,7 @@ void handleEmergencyPacket(const String &received) {
   emergId = id;
   emergHr = getField(received, "HR");
   emergSpo2 = getField(received, "SPO2");
-  emergTemp = getField(received, "TEMP");
+  emergRr = getField(received, "RR");
   emergWhy = getField(received, "WHY");
   emergWhy.replace("_", " ");
 
@@ -366,6 +366,38 @@ void handleEmergencyPacket(const String &received) {
 
   mode = M_EMERGENCY;
   showEmergency();
+}
+
+
+// Tutup layar darurat dan kembali ke layar sebelumnya
+void closeEmergency() {
+
+  mode = modeBeforeEmergency;
+
+  if (mode == M_HOME) showHome();
+  else if (mode == M_LOG) showLog();
+  else if (mode == M_FORM) showForm();
+  else if (mode == M_SCAN) showScan("WAITING FOR QR...");
+  else goHome();
+}
+
+
+// Format: EMEND|<id> -- LINK: darurat pasien ini sudah selesai
+void handleEmergencyEnd(const String &received) {
+
+  String id = received.substring(String("EMEND|").length());
+  id.trim();
+
+  if (id.length() == 0) {
+    return;
+  }
+
+  Serial.println("[LOG] Darurat selesai: " + id);
+
+  // Hanya tutup kalau layar yang terbuka memang untuk pasien ini
+  if (mode == M_EMERGENCY && id == emergId) {
+    closeEmergency();
+  }
 }
 
 
@@ -393,6 +425,11 @@ void receiveLoRa() {
 
   if (received.startsWith("EMERG|")) {
     handleEmergencyPacket(received);
+    return;
+  }
+
+  if (received.startsWith("EMEND|")) {
+    handleEmergencyEnd(received);
     return;
   }
 
@@ -483,13 +520,7 @@ void handleButtons() {
   // Layar darurat bisa ditutup dari mode APAPUN dengan tombol SELECT
   if (mode == M_EMERGENCY) {
     if (pressed(BTN_SELECT) || pressed(BTN_LOG)) {
-      mode = modeBeforeEmergency;
-
-      if (mode == M_HOME) showHome();
-      else if (mode == M_LOG) showLog();
-      else if (mode == M_FORM) showForm();
-      else if (mode == M_SCAN) showScan("WAITING FOR QR...");
-      else goHome();
+      closeEmergency();
     }
     return;
   }

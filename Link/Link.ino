@@ -414,8 +414,8 @@ void updateEmergencyState(int idx, int lv) {
       }
 
       char pkt[120];
-      snprintf(pkt, sizeof(pkt), "EMERG|%s|HR=%d|SPO2=%d|WHY=%s",
-               p.id.c_str(), p.hr, p.spo2, why);
+      snprintf(pkt, sizeof(pkt), "EMERG|%s|HR=%d|SPO2=%d|RR=%d|WHY=%s",
+               p.id.c_str(), p.hr, p.spo2, p.rr, why);
 
       // Jangan menumpuk EMERG yang sama di antrian
       if (!txHas("EMERG|" + p.id + "|")) {
@@ -431,6 +431,13 @@ void updateEmergencyState(int idx, int lv) {
     // Pasien sudah tidak kritis lagi -> reset supaya episode berikutnya memicu alert baru
     if (p.alert != 0) {
       p.alert = 0;
+
+      // Kabari LOG supaya layar daruratnya (kalau masih terbuka) ditutup
+      if (!txHas("EMEND|" + p.id)) {
+        txEnqueue("EMEND|" + p.id, PRIO_REG);
+      }
+
+      Serial.println("[LINK] Darurat " + p.id + " selesai -> EMEND ke LOG");
     }
   }
 }

@@ -200,7 +200,13 @@ void showEmergency() {
   tft.setCursor(35, 118);
   tft.print("SpO2 : "); tft.print(emergSpo2); tft.print(" %");
   tft.setCursor(35, 136);
-  tft.print("Suhu : "); tft.print(emergTemp);  tft.print(" C");
+  tft.print("RR   : ");
+  if (emergRr.length() == 0 || emergRr == "0") {
+    tft.print("-");
+  } else {
+    tft.print(emergRr);
+    tft.print(" napas/mnt");
+  }
 
   tft.setCursor(35, 160);
   tft.setTextColor(WARNING);
