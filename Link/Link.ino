@@ -1,6 +1,6 @@
 /*
  * ============================================================================
- * Nama Ciptaan    : Sistem Asesment kontinus untuk melakukan retriase
+ * Nama Ciptaan    : Sistem Penyiraman Tanaman Otomatis Berbasis IoT (SmartFarm)
  * Nama File       : VitraLink.ino
  * Pencipta        : Azra Nabila Azzahra
  * Mikrokontroler  : ESP32 DevKit V1
@@ -34,10 +34,9 @@ const char* AP_PASSWORD = "12345678";
 #define LORA_FREQUENCY 433E6
 
 // SF HARUS SAMA di Sense, Link, dan Log
-#define LORA_SF 11
+#define LORA_SF 9
 
 #include "vitra_radio.h"
-struct VitalAll;
 
 
 // -----------------------------------------------------
@@ -65,7 +64,7 @@ struct Patient {
   bool hasVitals = false;
   int hr = 0;
   int spo2 = 0;
-  int rr = 0;                
+  int rr = 0;                // laju napas (napas/menit), 0 = tidak ada data
   unsigned long lastVitalsMs = 0;
   int rssi = 0;
   int lastLevel = 0;
@@ -73,6 +72,7 @@ struct Patient {
 
   int alert = 0; // 0 = tidak ada, 1 = terkirim menunggu EMACK, 2 = di-EMACK LOG
   unsigned long lastEmergMs = 0;
+  uint8_t sos = 0;           // darurat dari Sense: 0 tidak ada, 1 jatuh, 2 tombol manual
 
   int lastSeq = -1;          // nomor urut paket SENSE terakhir (untuk hitung paket hilang)
 
@@ -99,7 +99,7 @@ unsigned long bootMs = 0;
 unsigned long packetCount = 0;      // semua paket SENSE yang diproses (RF + simulasi)
 
 // Statistik untuk pengujian
-uint32_t rfSense = 0, rfReg = 0, rfEmack = 0, rfOther = 0;
+uint32_t rfSense = 0, rfReg = 0, rfEmack = 0, rfOther = 0, rfSos = 0;
 uint32_t rfSeqRx = 0, rfLost = 0;
 uint32_t simPackets = 0;
 uint32_t rfProcUsAvg = 0;
@@ -369,91 +369,35 @@ bool upsertPatient(const String &id, const String &age,
 
 
 // =====================================================
-// KLASIFIKASI RR (laju napas, napas/menit)
-//   12 - 20            -> 0 Stabil
-//   10-11 atau 21-30   -> 1 Waspada
-//   < 10 atau > 30     -> 2 Darurat
-// rr <= 0 = Sense belum/tidak mengirim RR -> tidak ikut dinilai
-// =====================================================
-
-int classifyRR(int rr) {
-
-  if (rr <= 0) {
-    return 0;
-  }
-
-  if (rr < 10 || rr > 30) {
-    return 2;
-  }
-
-  if (rr <= 11 || rr >= 21) {
-    return 1;
-  }
-
-  return 0;
-}
-
-
-// Hasil gabungan HR + SpO2 (dari vitra_radio.h) + RR. lv = level terfburuk dari ketiganya.
-struct VitalAll {
-  VitalLevel v;   // HR + SpO2
-  int lr;         // level RR
-  int lv;         // level gabungan
-};
-
-
-VitalAll classifyAll(int hr, int spo2, int rr) {
-
-  VitalAll a;
-
-  a.v  = vitraClassify(hr, spo2);
-  a.lr = classifyRR(rr);
-  a.lv = (a.v.lv > a.lr) ? a.v.lv : a.lr;
-
-  return a;
-}
-
-
-// Alasan gabungan, dipisah "+" (contoh: "HR tinggi+RR rendah")
-void whyAll(VitalAll a, int rr, char *out, size_t n) {
-
-  vitraWhy(a.v, out, n);
-
-  if (a.v.lv == 0) {
-    out[0] = 0;
-  }
-
-  if (a.lr > 0) {
-
-    size_t len = strlen(out);
-
-    snprintf(out + len, n - len, "%s%s", len ? "+" : "", rr < 12 ? "RR rendah" : "RR tinggi");
-  }
-}
-
-
-// Nilai RR untuk pasien simulasi, sesuai kelasnya
-int simRR(uint8_t cls) {
-
-  if (cls >= 2) {
-    return random(2) ? (int)random(4, 10) : (int)random(31, 40);
-  }
-
-  if (cls == 1) {
-    return random(2) ? (int)random(21, 31) : (int)random(10, 12);
-  }
-
-  return (int)random(12, 21);
-}
-
-
-// =====================================================
 // DARURAT -- kirim & kelola alert ke VITRA LOG
 // =====================================================
+
+const char *sosName(uint8_t sos) {
+  return sos == 1 ? "Jatuh" : (sos == 2 ? "Tombol" : "");
+}
+
+// Alasan = jatuh/tombol (kalau ada) + HR/SpO2/RR yang abnormal.
+// Nilai vital 0 (belum ada data) tidak dinilai.
+void whyText(const Patient &p, char *out, size_t n) {
+
+  char vit[48];
+  vit[0] = 0;
+
+  if (p.hasVitals) {
+    vitraWhy(vitraClassify(p.hr, p.spo2, p.rr), vit, sizeof(vit));
+  }
+
+  snprintf(out, n, "%s%s%s", sosName(p.sos), (p.sos && vit[0]) ? "+" : "", vit);
+}
+
 
 void updateEmergencyState(int idx, int lv) {
 
   Patient &p = patients[idx];
+
+  if (p.sos) {
+    lv = 2;      // jatuh / tombol darurat selalu kritis, apa pun nilai vitalnya
+  }
 
   if (lv >= 2) {
 
@@ -462,16 +406,14 @@ void updateEmergencyState(int idx, int lv) {
 
     if (needSend) {
 
-      VitalAll v = classifyAll(p.hr, p.spo2, p.rr);
-
       char why[64];
-      whyAll(v, p.rr, why, sizeof(why));
+      whyText(p, why, sizeof(why));
 
       for (char *c = why; *c; c++) {
         if (*c == ' ') *c = '_';
       }
 
-      char pkt[140];
+      char pkt[120];
       snprintf(pkt, sizeof(pkt), "EMERG|%s|HR=%d|SPO2=%d|WHY=%s",
                p.id.c_str(), p.hr, p.spo2, why);
 
@@ -518,11 +460,11 @@ void emergencyTick() {
 
     Patient &p = patients[i];
 
-    if (p.sim || p.alert != 1 || !p.hasVitals) {
+    if (p.sim || p.alert != 1 || (!p.hasVitals && !p.sos)) {
       continue;
     }
 
-    updateEmergencyState(i, classifyAll(p.hr, p.spo2, p.rr).lv);
+    updateEmergencyState(i, p.hasVitals ? vitraClassify(p.hr, p.spo2, p.rr).lv : 0);
   }
 }
 
@@ -558,7 +500,7 @@ void applyVitals(int idx, int hr, int spo2, int rr, int rssi, int seq, bool allo
   p.lastVitalsMs = millis();
   p.rssi = rssi;
 
-  VitalAll v = classifyAll(hr, spo2, rr);
+  VitalLevel v = vitraClassify(hr, spo2, rr);
 
   if (v.lv != p.lastLevel) {
     Serial.printf("[LINK] %s level %d -> %d\n", p.id.c_str(), p.lastLevel, v.lv);
@@ -994,27 +936,30 @@ void handleApiData() {
 
     Patient &p = patients[i];
 
-    VitalAll v = classifyAll(p.hr, p.spo2, p.rr);
+    VitalLevel v = vitraClassify(p.hr, p.spo2, p.rr);
 
     if (!p.hasVitals) {
-      v.v.lh = v.v.ls = v.v.lv = 0;
-      v.lr = v.lv = 0;
+      v.lh = v.ls = v.lr = v.lv = 0;
+    }
+
+    if (p.sos) {
+      v.lv = 2;
     }
 
     char why[64];
-    whyAll(v, p.rr, why, sizeof(why));
+    whyText(p, why, sizeof(why));
 
     long ago = p.hasVitals ? (long)((millis() - p.lastVitalsMs) / 1000) : 0;
 
     n = snprintf(buf, sizeof(buf),
       "%s{\"id\":\"%s\",\"reg\":%s,\"age\":\"%s\",\"gender\":\"%s\",\"status\":\"%s\",\"triage\":\"%s\","
       "\"hasv\":%s,\"hr\":%d,\"spo2\":%d,\"rr\":%d,\"lh\":%d,\"ls\":%d,\"lr\":%d,\"lv\":%d,"
-      "\"why\":\"%s\",\"ago\":%ld,\"rssi\":%d,\"alert\":%d,\"done\":%s}",
+      "\"why\":\"%s\",\"ago\":%ld,\"rssi\":%d,\"alert\":%d,\"sos\":%d,\"done\":%s}",
       i > 0 ? "," : "",
       p.id.c_str(), p.reg ? "true" : "false",
       p.age.c_str(), p.gender.c_str(), p.status.c_str(), p.triage.c_str(),
       p.hasVitals ? "true" : "false", p.hr, p.spo2, p.rr,
-      v.v.lh, v.v.ls, v.lr, v.lv, why, ago, p.rssi, p.alert, p.done ? "true" : "false");
+      v.lh, v.ls, v.lr, v.lv, why, ago, p.rssi, p.alert, p.sos, p.done ? "true" : "false");
 
     if (n > 0 && n < (int)sizeof(buf)) {
       outAdd(buf, n);
@@ -1140,11 +1085,9 @@ void simTick() {
       continue;
     }
 
-    int hr, spo2;
+    int hr, spo2, rr;
 
-    vitraSimValues(p.simClass, hr, spo2);
-
-    int rr = simRR(p.simClass);
+    vitraSimValues(p.simClass, hr, spo2, rr);
 
     p.simNext += simMs;
 
@@ -1343,6 +1286,68 @@ void handleSenseData(const String &packet, int rssi) {
 
 
 // =====================================================
+// DARURAT DARI SENSE (jatuh / tombol)
+// Format: SOS|VITRA-001|T=1[|HR=80|SPO2=98|RR=16]
+//   T=1 jatuh, T=2 tombol manual, T=0 darurat selesai
+// Dibalas SACK|<id>|T=<t>; Sense mengulang sampai SACK diterima.
+// =====================================================
+
+void handleSos(const String &packet, int rssi) {
+
+  int a = packet.indexOf('|');
+  int b = packet.indexOf('|', a + 1);
+
+  String id = (b > a) ? packet.substring(a + 1, b) : "";
+
+  if (id.length() == 0 || id.length() > 20 || sanitizeField(id, 20) != id) {
+    return;
+  }
+
+  String t = getField(packet, "T");
+
+  if (t != "0" && t != "1" && t != "2") {
+    return;
+  }
+
+  int idx = findOrCreatePatient(id);
+
+  if (idx < 0) {
+    Serial.println("[LINK] SOS ditolak, penyimpanan penuh: " + id);
+    return;
+  }
+
+  Patient &p = patients[idx];
+
+  uint8_t type = (uint8_t)t.toInt();
+  bool changed = (p.sos != type);
+
+  // Nilai vital yang ikut dikirim (kalau Sense punya pembacaan valid)
+  int hr = getField(packet, "HR").toInt();
+
+  if (hr > 0) {
+    applyVitals(idx, hr, getField(packet, "SPO2").toInt(), getField(packet, "RR").toInt(),
+                rssi, -1, false);
+  }
+
+  p.sos = type;
+
+  if (changed) {
+    Serial.printf("[SOS] %s %s (%4d dBm)\n", id.c_str(),
+                  type ? (type == 1 ? "JATUH TERDETEKSI" : "TOMBOL DARURAT") : "darurat selesai",
+                  rssi);
+  }
+
+  String ack = "SACK|" + id + "|T=" + t;
+
+  if (!txHas("SACK|" + id + "|")) {
+    txEnqueue(ack, PRIO_CRIT);
+  }
+
+  updateEmergencyState(idx, p.hasVitals ? vitraClassify(p.hr, p.spo2, p.rr).lv : 0);
+}
+
+
+// =====================================================
 // PAKET LoRa MASUK 
 // =====================================================
 
@@ -1355,6 +1360,11 @@ void onLoRaPacket(const String &received, int rssi) {
     rfSense++;
     packetCount++;
     handleSenseData(received, rssi);
+
+  } else if (received.startsWith("SOS|")) {
+
+    rfSos++;
+    handleSos(received, rssi);
 
   } else if (received.startsWith("REG|")) {
 

@@ -8,26 +8,32 @@
 #error "Definisikan LORA_SS sebelum #include \"vitra_radio.h\""
 #endif
 #ifndef LORA_SF
-#define LORA_SF 9
+#define LORA_SF 11
 #endif
-
 
 // ---------------------------------------------------------------------
 // 1. AMBANG VITAL
 // ---------------------------------------------------------------------
-#define HR_CRIT_HI    130     // > 130 atau < 50   -> kritis
+#define HR_CRIT_HI    140
 #define HR_CRIT_LO     50
-#define HR_WARN_HI    100     // > 100 atau < 60   -> waspada
+#define HR_WARN_HI    120
 #define HR_WARN_LO     60
-#define SPO2_CRIT      90     // < 90              -> kritis
-#define SPO2_WARN      95     // < 95              -> waspada
-#define TEMP_CRIT_HI  39.0f   // >= 39.0 atau < 35.0 -> kritis
-#define TEMP_CRIT_LO  35.0f
-#define TEMP_WARN_HI  38.0f   // >= 38.0 atau < 35.5 -> waspada
-#define TEMP_WARN_LO  35.5f
+
+#define SPO2_CRIT      90
+#define SPO2_WARN      95
+
+// RR = laju napas (napas/menit)
+//   12 - 20           -> normal
+//   10-11 atau 21-30  -> waspada
+//   < 10 atau > 30    -> kritis
+// rr <= 0 berarti RR tidak tersedia (belum/tidak diukur) dan tidak ikut dinilai.
+#define RR_CRIT_LO     10
+#define RR_CRIT_HI     30
+#define RR_WARN_LO     12
+#define RR_WARN_HI     20
 
 struct VitalLevel {
-  int8_t lh, ls, lt, lv;      // 0 normal, 1 waspada, 2 kritis (lv = terparah)
+  int8_t lh, ls, lv, lr;  // 0 normal, 1 waspada, 2 kritis (lv = terburuk dari HR/SpO2/RR; lr = RR)
 };
 
 static inline int vitraLevelHr(int hr) {
@@ -42,46 +48,78 @@ static inline int vitraLevelSpo2(int s) {
   return 0;
 }
 
-static inline int vitraLevelTemp(float t) {
-  if (t >= TEMP_CRIT_HI || t < TEMP_CRIT_LO) return 2;
-  if (t >= TEMP_WARN_HI || t < TEMP_WARN_LO) return 1;
+static inline int vitraLevelRr(int rr) {
+  if (rr <= 0) return 0;
+  if (rr < RR_CRIT_LO || rr > RR_CRIT_HI) return 2;
+  if (rr < RR_WARN_LO || rr > RR_WARN_HI) return 1;
   return 0;
 }
 
-static inline VitalLevel vitraClassify(int hr, int spo2, float temp) {
+static inline VitalLevel vitraClassify(int hr, int spo2, int rr = 0) {
   VitalLevel v;
+
   int lh = vitraLevelHr(hr);
   int ls = vitraLevelSpo2(spo2);
-  int lt = vitraLevelTemp(temp);
-  int lv = lh;
-  if (ls > lv) lv = ls;
-  if (lt > lv) lv = lt;
-  v.lh = lh; v.ls = ls; v.lt = lt; v.lv = lv;
+  int lr = vitraLevelRr(rr);
+
+  int worst = (lh > ls) ? lh : ls;
+
+  v.lh = lh;
+  v.ls = ls;
+  v.lr = lr;
+  v.lv = (worst > lr) ? worst : lr;
+
   return v;
 }
 
 static void vitraWhy(const VitalLevel &v, char *out, size_t n) {
-  const char *names[3] = { "HR", "SpO2", "Suhu" };
-  int lv[3] = { v.lh, v.ls, v.lt };
+  const char *names[3] = { "HR", "SpO2", "RR" };
+  int lv[3] = { v.lh, v.ls, v.lr };
+
   size_t len = 0;
   out[0] = 0;
+
   for (int i = 0; i < 3; i++) {
     if (lv[i] <= 0) continue;
-    int w = snprintf(out + len, n - len, "%s%s %s",
-                     len ? "+" : "", names[i], lv[i] >= 2 ? "Kritis" : "Waspada");
+
+    int w = snprintf(
+      out + len,
+      n - len,
+      "%s%s %s",
+      len ? "+" : "",
+      names[i],
+      lv[i] >= 2 ? "Kritis" : "Waspada"
+    );
+
     if (w < 0) break;
+
     len += (size_t)w;
     if (len >= n) break;
   }
 }
 
-static void vitraSimValues(int mode, int &hr, int &spo2, float &temp) {
+static void vitraSimValues(int mode, int &hr, int &spo2) {
   if (mode >= 2) {
-    hr = random(140, 160); spo2 = random(82, 88); temp = random(396, 405) / 10.0f;
+    hr = random(141, 160);
+    spo2 = random(82, 88);
   } else if (mode == 1) {
-    hr = random(105, 126); spo2 = random(91, 95); temp = random(381, 389) / 10.0f;
+    hr = random(121, 140);
+    spo2 = random(91, 95);
   } else {
-    hr = random(70, 100);  spo2 = random(95, 100); temp = random(360, 380) / 10.0f;
+    hr = random(70, 100);
+    spo2 = random(95, 100);
+  }
+}
+
+static void vitraSimValues(int mode, int &hr, int &spo2, int &rr) {
+  vitraSimValues(mode, hr, spo2);
+
+  if (mode >= 2) {
+    rr = random(2) ? (int)random(4, 10) : (int)random(31, 40);
+  } else if (mode == 1) {
+    rr = random(2) ? (int)random(21, 31) : (int)random(10, 12);
+  } else {
+    rr = (int)random(12, 21);
   }
 }
 
@@ -90,16 +128,15 @@ static void vitraSimValues(int mode, int &hr, int &spo2, float &temp) {
 #endif
 
 #if VITRA_REAL_TIME
-  #define VITRA_SESSION_MS       7200000UL 
-  #define VITRA_SEND_INTERVAL_MS  900000UL  
+  #define VITRA_SESSION_MS       7200000UL
+  #define VITRA_SEND_INTERVAL_MS  900000UL
 #else
-  #define VITRA_SESSION_MS        120000UL  
-  #define VITRA_SEND_INTERVAL_MS   15000UL   
+  #define VITRA_SESSION_MS        120000UL
+  #define VITRA_SEND_INTERVAL_MS   15000UL
 #endif
 
 #define VITRA_SESSION_SENDS (VITRA_SESSION_MS / VITRA_SEND_INTERVAL_MS)
 #define VITRA_OFFLINE_S     (VITRA_SEND_INTERVAL_MS * 2UL / 1000UL + 10UL)
-
 
 // ---------------------------------------------------------------------
 // 2. RADIO
@@ -108,12 +145,16 @@ static void vitraSimValues(int mode, int &hr, int &spo2, float &temp) {
 #define PRIO_WARN   1
 #define PRIO_REG    2
 #define PRIO_NORMAL 3
-struct VitraWin { uint16_t lo, hi, maxWait; };
+
+struct VitraWin {
+  uint16_t lo, hi, maxWait;
+};
+
 static const VitraWin VITRA_WIN[4] = {
-  {   0,  30, 1500 },   // CRIT
-  {  40, 120, 2500 },   // WARN
-  { 140, 300, 4000 },   // REG
-  { 320, 900, 8000 },   // NORMAL
+  {   0,  30, 1500 },
+  {  40, 120, 2500 },
+  { 140, 300, 4000 },
+  { 320, 900, 8000 },
 };
 
 #define VITRA_MIN_LISTEN_MS ((3UL << LORA_SF) / 125UL + 4UL)
@@ -128,20 +169,23 @@ struct VitraTxStats {
   uint32_t sent[4], deferred[4], forced[4], waitSum[4], waitMax[4];
   uint32_t airMs;
 };
+
 static VitraTxStats vitraTx;
 static uint32_t vitraLastWaitMs = 0;
 
 typedef void (*VitraRxHandler)(const String &pkt, int rssi);
-static VitraRxHandler vitraRxHandler = nullptr;  
-static void (*vitraIdleHook)() = nullptr;         
 
+static VitraRxHandler vitraRxHandler = nullptr;
+static void (*vitraIdleHook)() = nullptr;
 
 static uint8_t vitraReadReg(uint8_t reg) {
   SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+
   digitalWrite(LORA_SS, LOW);
   SPI.transfer(reg & 0x7F);
   uint8_t v = SPI.transfer(0x00);
   digitalWrite(LORA_SS, HIGH);
+
   SPI.endTransaction();
   return v;
 }
@@ -151,16 +195,21 @@ static void vitraRadioConfig() {
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
   LoRa.enableCrc();
+  LoRa.setTxPower(20, PA_OUTPUT_PA_BOOST_PIN); 
 }
 
 static uint32_t vitraAirtimeMs(int payloadLen) {
   const float tsym = (float)(1UL << LORA_SF) / 125.0f;
   const int de = (LORA_SF >= 11) ? 1 : 0;
+
   float num = 8.0f * payloadLen - 4.0f * LORA_SF + 28.0f + 16.0f;
   float den = 4.0f * (LORA_SF - 2 * de);
+
   int blocks = (int)ceilf(num / den);
   if (blocks < 0) blocks = 0;
+
   float symbols = 12.25f + 8.0f + blocks * 5.0f;
+
   return (uint32_t)(symbols * tsym + 0.5f);
 }
 
@@ -171,7 +220,6 @@ static void vitraArmRx() {
 }
 
 static bool vitraPoll() {
-
   if (!(vitraReadReg(VR_REG_IRQFLAGS) & VR_IRQ_RXDONE)) {
     vitraArmRx();
     return false;
@@ -183,17 +231,17 @@ static bool vitraPoll() {
 
   if (n > 0) {
     s.reserve(n + 1);
+
     while (LoRa.available()) {
       s += (char)LoRa.read();
     }
+
     rssi = LoRa.packetRssi();
   }
 
-  LoRa.receive();       
+  LoRa.receive();
 
-  if (n <= 0) {
-    return false;
-  }
+  if (n <= 0) return false;
 
   s.trim();
 
@@ -205,19 +253,17 @@ static bool vitraPoll() {
 }
 
 static bool vitraChannelBusy() {
-  if (vitraReadReg(VR_REG_MODEMSTAT) & 0x03) {   
+  if (vitraReadReg(VR_REG_MODEMSTAT) & 0x03) {
     return true;
   }
+
   return LoRa.rssi() > VITRA_CCA_RSSI_DBM;
 }
 
 static bool vitraSend(const String &msg, uint8_t prio) {
-
   static bool inSend = false;
 
-  if (inSend) {
-    return false;           
-  }
+  if (inSend) return false;
 
   inSend = true;
 
@@ -228,12 +274,16 @@ static bool vitraSend(const String &msg, uint8_t prio) {
   const uint32_t t0 = millis();
   uint32_t last = t0;
   uint32_t listened = 0;
-  int32_t backoff = (int32_t)random((long)w.lo, (long)w.hi + 1);
+
+  int32_t backoff = (int32_t)random(
+    (long)w.lo,
+    (long)w.hi + 1
+  );
+
   bool deferred = false;
   bool forced = false;
 
   while (true) {
-
     vitraPoll();
 
     if (vitraIdleHook) {
@@ -245,13 +295,13 @@ static bool vitraSend(const String &msg, uint8_t prio) {
     last = now;
 
     if (now - t0 >= w.maxWait) {
-      forced = true;        
+      forced = true;
       break;
     }
 
     if (vitraChannelBusy()) {
       deferred = true;
-      listened = 0;          
+      listened = 0;
       delay(2);
       continue;
     }
@@ -278,9 +328,14 @@ static bool vitraSend(const String &msg, uint8_t prio) {
 
   vitraTx.sent[prio]++;
   vitraTx.waitSum[prio] += vitraLastWaitMs;
-  if (vitraLastWaitMs > vitraTx.waitMax[prio]) vitraTx.waitMax[prio] = vitraLastWaitMs;
+
+  if (vitraLastWaitMs > vitraTx.waitMax[prio]) {
+    vitraTx.waitMax[prio] = vitraLastWaitMs;
+  }
+
   if (deferred) vitraTx.deferred[prio]++;
   if (forced) vitraTx.forced[prio]++;
+
   vitraTx.airMs += (tEnd - tTx);
 
   vitraArmRx();
@@ -288,4 +343,12 @@ static bool vitraSend(const String &msg, uint8_t prio) {
   inSend = false;
 
   return ok == 1;
+}
+
+static void vitraPrintNoiseFloor() {
+  LoRa.receive();
+  delay(200);
+  long s = 0;
+  for (int i = 0; i < 50; i++) { s += LoRa.rssi(); delay(10); }
+  Serial.println("[LoRa] Noise floor: " + String(s / 50) + " dBm");
 }
